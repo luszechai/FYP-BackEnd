@@ -1,0 +1,23 @@
+# Core dependencies
+numpy>=1.24.0
+pandas>=2.0.0
+
+# LLM and API
+openai>=1.0.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Text Processing
+langchain-text-splitters>=0.0.1
+beautifulsoup4>=4.12.0
+sentence-transformers>=2.2.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+requests>=2.31.0
+python-dotenv>=1.0.0
+
