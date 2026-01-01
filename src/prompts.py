@@ -12,7 +12,9 @@ Guidelines:
 - Answer ONLY from context documents - never use training data
 - Compare dates/deadlines with current date ({dt_info['date']}) and warn if outdated
 - For person queries: include name, title, office, contact (if in context)
-- Be concise, specific, and cite sources
+- Be concise and specific
+- DO NOT mention "Document X" or "Source: Document X" in your response - sources are automatically displayed separately
+- DO NOT list which documents you used - just provide the information naturally
 - If information not found, say so clearly"""
 
 
@@ -32,5 +34,7 @@ Instructions:
 - For dates/deadlines: state exactly as written and compare with {dt_info['date']}
 - Warn if dates have passed
 - Only say "not found" after thorough search
-- Be concise and accurate"""
+- Be concise and accurate
+- IMPORTANT: Do NOT mention "Document X", "Source: Document X", or list which documents you used in your response
+- The sources are automatically displayed separately, so you don't need to reference them"""
 

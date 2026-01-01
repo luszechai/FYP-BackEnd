@@ -8,7 +8,7 @@ from src.vector_db import ChromaDBManager
 from src.llm_provider import LLMProvider
 from src.retrieval import HybridRetriever
 from src.prompts import build_system_message, build_user_prompt
-from src.utils import get_current_datetime_info, is_deadline_query
+from src.utils import get_current_datetime_info, is_deadline_query, should_skip_retrieval
 from src.adaptive_config import AdaptiveConfig
 
 
@@ -39,6 +39,11 @@ class RAGChatbot:
     def retrieve_context(self, query: str, use_memory: bool = True) -> Tuple[List[Dict], str, Dict]:
         """Enhanced retrieval with query preprocessing"""
         enhanced_query = self.query_enhancer.enhance_query(query)
+
+        # Skip retrieval for simple/non-informative queries
+        if should_skip_retrieval(query):
+            print("⏭️ Skipping retrieval for simple query")
+            return [], "", enhanced_query
 
         # Get adaptive configuration
         if self.use_adaptive_config:
@@ -173,7 +178,11 @@ class RAGChatbot:
         # Generate response
         generation_start = time.time()
         if not context:
-            response_text = "I couldn't find any relevant information in the admission documents."
+            # For simple queries, provide a friendly response without retrieval
+            if should_skip_retrieval(query):
+                response_text = "How can I help you with SFU admission information?"
+            else:
+                response_text = "I couldn't find any relevant information in the admission documents."
         else:
             response_text = self.generate_response(query, context, use_memory=use_memory)
         generation_time = time.time() - generation_start

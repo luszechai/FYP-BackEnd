@@ -77,13 +77,18 @@ class ChromaDBManager:
                 ids.append(chunk_id)
                 documents.append(chunk)
 
+                doc_metadata = doc.get('metadata', {})
                 metadata = {
                     'section': doc.get('section', ''),
-                    'source': doc.get('metadata', {}).get('source', ''),
+                    'source': doc_metadata.get('source', ''),
                     'chunk_index': j,
                     'total_chunks': len(chunks),
                     'parent_doc_id': f"doc_{i}",
-                    'structured': doc.get('metadata', {}).get('structured', False)
+                    'structured': doc_metadata.get('structured', False),
+                    # Preserve URL information if available
+                    'url': doc_metadata.get('url', ''),
+                    'link': doc_metadata.get('link', ''),
+                    'source_url': doc_metadata.get('source_url', ''),
                 }
                 metadatas.append(metadata)
 

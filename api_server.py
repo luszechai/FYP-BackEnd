@@ -136,16 +136,72 @@ async def chat(request: ChatRequest):
             "generation_time": float(response['performance']['generation_time'])
         }
         
-        # Clean up sources for JSON serialization
+        # Clean up sources for JSON serialization and add source links
+        # Deduplicate sources by parent_doc_id or source_url to avoid showing multiple chunks from same document
+        seen_sources = {}  # key: (parent_doc_id or source_url), value: source data
         sources = []
+        
         for source in response.get('sources', []):
-            sources.append({
-                "id": source.get('id', ''),
-                "document": source.get('document', '')[:500] + "..." if len(source.get('document', '')) > 500 else source.get('document', ''),
-                "metadata": source.get('metadata', {}),
-                "similarity": float(source.get('similarity', 0)),
-                "retrieval_score": float(source.get('retrieval_score', 0))
-            })
+            metadata = source.get('metadata', {})
+            section = metadata.get('section', 'Unknown Section')
+            source_file = metadata.get('source', '')
+            parent_doc_id = metadata.get('parent_doc_id', '')
+            
+            # Extract source URL - the 'source' field in metadata contains the URL
+            # Check for URL in metadata (could be 'url', 'link', 'source_url', or 'source' field)
+            source_url = (
+                metadata.get('url') or 
+                metadata.get('link') or 
+                metadata.get('source_url') or
+                (source_file if source_file and (source_file.startswith('http://') or source_file.startswith('https://')) else None)
+            )
+            
+            # If no URL found, try to construct from source_file
+            if not source_url and source_file:
+                # If source_file looks like a URL path, construct full URL
+                if source_file.startswith('/'):
+                    # Use base URL from config
+                    base_url = Config.SOURCE_BASE_URL
+                    source_url = base_url + source_file
+                elif 'www.' in source_file or '.edu' in source_file or '.hk' in source_file:
+                    # Add https:// if missing
+                    if not source_file.startswith('http'):
+                        source_url = 'https://' + source_file
+                    else:
+                        source_url = source_file
+            
+            # Use parent_doc_id or source_url as unique key for deduplication
+            # Prefer parent_doc_id if available, otherwise use source_url
+            unique_key = parent_doc_id if parent_doc_id else (source_url if source_url else source.get('id', ''))
+            
+            # Only add if we haven't seen this source before
+            if unique_key and unique_key not in seen_sources:
+                # Generate source identifier
+                source_id = f"doc_{parent_doc_id}" if parent_doc_id else source.get('id', '')
+                source_name = f"Document {len(seen_sources) + 1} - {section}"
+                
+                source_data = {
+                    "id": source.get('id', ''),
+                    "source_id": source_id,
+                    "source_name": source_name,
+                    "source_url": source_url if source_url else None,  # External URL to original source (None if not available)
+                    "section": section,
+                    "source_file": source_file,
+                    "document": source.get('document', '')[:500] + "..." if len(source.get('document', '')) > 500 else source.get('document', ''),
+                    "metadata": metadata,
+                    "similarity": float(source.get('similarity', 0)),
+                    "retrieval_score": float(source.get('retrieval_score', 0)),
+                    "rank": len(seen_sources) + 1  # Re-rank after deduplication
+                }
+                
+                seen_sources[unique_key] = source_data
+                sources.append(source_data)
+            elif unique_key in seen_sources:
+                # Update similarity/score if this chunk has higher score
+                existing = seen_sources[unique_key]
+                if source.get('retrieval_score', 0) > existing.get('retrieval_score', 0):
+                    existing['similarity'] = float(source.get('similarity', 0))
+                    existing['retrieval_score'] = float(source.get('retrieval_score', 0))
         
         return ChatResponse(
             answer=response['answer'],
@@ -244,6 +300,67 @@ async def get_history():
         history=history,
         count=len(history)
     )
+
+
+@app.get("/api/sources/{source_id}")
+async def get_source(source_id: str):
+    """Get full source document by ID"""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    try:
+        # Query the vector database for all chunks of this source
+        # Extract parent_doc_id from source_id
+        if source_id.startswith("doc_"):
+            # Find all chunks with this parent_doc_id
+            results = chatbot_instance.db.collection.get(
+                where={"parent_doc_id": source_id}
+            )
+            
+            if not results['ids']:
+                raise HTTPException(status_code=404, detail="Source not found")
+            
+            # Combine all chunks and sort by chunk_index
+            chunks = []
+            for i, doc_id in enumerate(results['ids']):
+                doc_index = results['metadatas'][i].get('chunk_index', 0)
+                chunks.append({
+                    'index': doc_index,
+                    'content': results['documents'][i],
+                    'metadata': results['metadatas'][i]
+                })
+            
+            chunks.sort(key=lambda x: x['index'])
+            full_content = '\n\n'.join([chunk['content'] for chunk in chunks])
+            
+            metadata = chunks[0]['metadata'] if chunks else {}
+            
+            return {
+                "source_id": source_id,
+                "section": metadata.get('section', 'Unknown Section'),
+                "source_file": metadata.get('source', ''),
+                "content": full_content,
+                "metadata": metadata,
+                "total_chunks": len(chunks)
+            }
+        else:
+            # Single chunk lookup
+            results = chatbot_instance.db.collection.get(ids=[source_id])
+            if not results['ids']:
+                raise HTTPException(status_code=404, detail="Source not found")
+            
+            return {
+                "source_id": source_id,
+                "section": results['metadatas'][0].get('section', 'Unknown Section'),
+                "source_file": results['metadatas'][0].get('source', ''),
+                "content": results['documents'][0],
+                "metadata": results['metadatas'][0],
+                "total_chunks": 1
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving source: {str(e)}")
 
 
 @app.get("/api/stats", response_model=StatsResponse)

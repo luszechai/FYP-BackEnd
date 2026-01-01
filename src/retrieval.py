@@ -96,8 +96,7 @@ class HybridRetriever:
                                     if kw.lower() in content_lower)
                 
                 # Boost for deadline-related keywords in scholarship queries
-                deadline_keywords = ['deadline', 'due date', 'application', 'end of', 'july', 'august', 
-                                    'september', 'march', 'april', 'may', 'june']
+                deadline_keywords = ['deadline', 'due date', 'application', 'end of','january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'end of application', 'end of submission', 'end of deadline','submission deadline']
                 deadline_matches = sum(1 for dk in deadline_keywords if dk in content_lower)
                 
                 if keyword_matches > 0:

@@ -44,6 +44,9 @@ class Config:
     # Data Files
     DATA_FILE: str = "merged_rag_data.json"
     
+    # Source URL Configuration
+    SOURCE_BASE_URL: str = os.getenv("SOURCE_BASE_URL", "https://www.sfu.edu.hk")
+    
     @classmethod
     def validate(cls):
         """Validate configuration"""
