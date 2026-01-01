@@ -55,8 +55,17 @@ class QueryEnhancer:
             if re.search(pattern, query, re.IGNORECASE):
                 return True
 
+        # Check for capitalized words, but exclude the first word (often capitalized by grammar)
+        # and require at least 2 capitalized words OR a capitalized word not at the start
         words = query.split()
-        capitalized = [w for w in words if w and len(w) > 1 and w[0].isupper()]
+        if len(words) == 0:
+            return False
+        
+        # Get all capitalized words (excluding the first word)
+        capitalized = [w for w in words[1:] if w and len(w) > 1 and w[0].isupper()]
+        
+        # Return True if there are multiple capitalized words (likely a name)
+        # OR if there's at least one capitalized word in the middle/end of the sentence
         return len(capitalized) >= 1
 
     def extract_name_components(self, query: str) -> Dict[str, List[str]]:
@@ -199,13 +208,15 @@ class QueryEnhancer:
             'keywords': []
         }
 
-        if is_person:
-            enhanced['expanded_queries'] = self.expand_person_query(query)
-            enhanced['keywords'] = self.extract_name_components(query)['potential_names']
-        elif is_program:
+        # Prioritize program queries over person queries when both are detected
+        # This prevents course queries from being misclassified as person queries
+        if is_program:
             enhanced['expanded_queries'] = self.expand_program_query(query)
             # Use course codes as high-value keywords
             enhanced['keywords'] = re.findall(r'\b[a-z]{2,4}\d{3,4}\b', query.lower().replace(" ", ""))
+        elif is_person:
+            enhanced['expanded_queries'] = self.expand_person_query(query)
+            enhanced['keywords'] = self.extract_name_components(query)['potential_names']
         else:
             enhanced['expanded_queries'] = [query]
             enhanced['keywords'] = query.split()

@@ -26,7 +26,8 @@ def main():
         llm = LLMProvider(
             provider="deepseek",
             api_key=Config.DEEPSEEK_API_KEY,
-            temperature=Config.LLM_TEMPERATURE
+            temperature=Config.LLM_TEMPERATURE,
+            enable_cache=Config.LLM_ENABLE_CACHE
         )
         db = ChromaDBManager(
             persist_directory=Config.CHROMA_DB_DIR,

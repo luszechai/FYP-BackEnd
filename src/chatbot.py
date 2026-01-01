@@ -83,13 +83,29 @@ class RAGChatbot:
         top_results = filtered_docs[:k]
 
         context_parts = []
+        # Limit individual document length to prevent excessive context
+        max_doc_length = 2000  # characters per document
+        
         for result in top_results:
             section = result['metadata'].get('section', 'Unknown Section')
             content = result['document']
             rank = result['rank']
+            
+            # Truncate very long documents (keep first part which is usually most relevant)
+            if len(content) > max_doc_length:
+                content = content[:max_doc_length] + "... [truncated]"
+            
             context_parts.append(f"[Document {rank} - {section}] (Score: {result['retrieval_score']:.3f})\n{content}")
 
         context_string = "\n\n---\n\n".join(context_parts)
+        
+        # Limit total context size (approximately 8000 chars = ~2000 tokens)
+        max_total_context = 8000
+        if len(context_string) > max_total_context:
+            # Keep the highest scoring documents
+            context_parts = context_parts[:min(len(context_parts), 5)]
+            context_string = "\n\n---\n\n".join(context_parts)
+        
         return top_results, context_string, enhanced_query
 
     def generate_response(self, query: str, context: str, use_memory: bool = True) -> str:
