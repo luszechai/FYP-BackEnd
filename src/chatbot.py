@@ -28,6 +28,7 @@ class RAGChatbot:
         self.retriever = HybridRetriever(chroma_db=chroma_db, retrieval_k=base_retrieval_k)
         self.retrieval_k = base_retrieval_k
 
+
         # Initialize metrics tracking
         self.session_metrics = []
 
