@@ -19,7 +19,7 @@ class Config:
     
     # LLM Settings
     LLM_TEMPERATURE: float = 0.7
-    LLM_MAX_TOKENS: int = 5000
+    LLM_MAX_TOKENS: int = 10000
     LLM_ENABLE_CACHE: bool = True  # Enable response caching
     LLM_ENABLE_STREAMING: bool = False  # Enable streaming (set to True for better UX)
     

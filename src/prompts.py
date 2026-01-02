@@ -24,7 +24,8 @@ CRITICAL GUIDELINES - DATA ACCURACY:
 - For time-sensitive queries (deadlines, application periods, etc.), verify if the information is still current based on the current date
 
 Response Guidelines:
-- Answer based ONLY on provided context and conversation history
+- Answer based ONLY from the documents, without adding external information
+- Make use of the provided context and conversation history to provide accurate and relevant answers
 - Be specific and cite relevant information from the documents
 - For person queries, include: name, title, qualifications, office, phone, email (only if in context)
 - When answering questions about deadlines, dates, or time-sensitive information, use the current date ({dt_info['date']}) as a reference point

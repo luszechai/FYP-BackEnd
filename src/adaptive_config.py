@@ -8,7 +8,7 @@ class AdaptiveConfig:
     
     # Base configuration values (can be overridden)
     BASE_RETRIEVAL_K = 5
-    BASE_MAX_TOKENS = 5000
+    BASE_MAX_TOKENS = 10000
     BASE_SIMILARITY_THRESHOLD = 0.1
     BASE_MEMORY_HISTORY = 3
     
