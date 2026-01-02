@@ -9,6 +9,7 @@ import pandas as pd
 from src.chatbot import RAGChatbot
 from src.llm_provider import LLMProvider
 from src.vector_db import ChromaDBManager
+from src.evaluation import calculate_hit_rate, generate_evaluation_dashboard, get_available_evaluation_methods
 from config import Config
 import json
 import time
@@ -68,6 +69,7 @@ async def startup_event():
             provider="deepseek",
             api_key=Config.DEEPSEEK_API_KEY,
             temperature=Config.LLM_TEMPERATURE,
+            max_tokens=Config.LLM_MAX_TOKENS,
             enable_cache=Config.LLM_ENABLE_CACHE
         )
         
@@ -364,8 +366,11 @@ async def get_source(source_id: str):
 
 
 @app.get("/api/stats", response_model=StatsResponse)
-async def get_stats():
-    """Get session statistics"""
+async def get_stats(
+    hit_rate_method: str = 'max_similarity',
+    hit_rate_threshold: float = 0.5
+):
+    """Get session statistics with configurable evaluation method"""
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
     
@@ -380,13 +385,20 @@ async def get_stats():
     
     df = pd.DataFrame(chatbot_instance.session_metrics)
     
+    # Use new evaluation method instead of old 'hit' field
+    hit_rate = calculate_hit_rate(
+        chatbot_instance.session_metrics,
+        method=hit_rate_method,
+        threshold=hit_rate_threshold
+    ) * 100  # Convert to percentage
+    
     # Convert metrics to JSON-serializable format
     metrics = []
     for metric in chatbot_instance.session_metrics:
         metrics.append({
             "query": metric['query'],
             "category": metric['category'],
-            "hit": bool(metric['hit']),
+            "hit": bool(metric['hit']),  # Keep for backward compatibility
             "avg_similarity": float(metric['avg_similarity']),
             "max_similarity": float(metric['max_similarity']),
             "min_similarity": float(metric['min_similarity']),
@@ -400,9 +412,43 @@ async def get_stats():
         total_queries=len(df),
         avg_response_time=float(df['response_time'].mean()),
         avg_similarity=float(df['avg_similarity'].mean()),
-        hit_rate=float(df['hit'].sum() / len(df) * 100),
+        hit_rate=float(hit_rate),  # Use new calculation
         metrics=metrics
     )
+
+
+@app.post("/api/evaluate")
+async def evaluate(
+    hit_rate_method: str = 'max_similarity',
+    hit_rate_threshold: float = 0.5
+):
+    """Generate evaluation dashboard"""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    if not chatbot_instance.session_metrics:
+        raise HTTPException(status_code=400, detail="No metrics available. Make some chat requests first.")
+    
+    try:
+        generate_evaluation_dashboard(
+            chatbot_instance.session_metrics,
+            hit_rate_method=hit_rate_method,
+            hit_rate_threshold=hit_rate_threshold
+        )
+        
+        return {
+            "message": "Evaluation dashboard generated successfully",
+            "method": hit_rate_method,
+            "threshold": hit_rate_threshold
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating dashboard: {str(e)}")
+
+
+@app.get("/api/evaluation/methods")
+async def get_evaluation_methods():
+    """Get available evaluation methods"""
+    return get_available_evaluation_methods()
 
 
 if __name__ == "__main__":

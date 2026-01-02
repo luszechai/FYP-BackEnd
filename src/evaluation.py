@@ -2,20 +2,102 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 
 
-def generate_evaluation_dashboard(metrics: List[Dict]):
-    """Generate the 4-panel evaluation dashboard with response time tracking"""
+def get_available_evaluation_methods() -> Dict[str, str]:
+    """
+    Get a dictionary of available evaluation methods with descriptions.
+    
+    Returns:
+        Dictionary mapping method names to descriptions
+    """
+    return {
+        'max_similarity': 'Hit if maximum similarity score >= threshold (recommended)',
+        'avg_similarity': 'Hit if average similarity score >= threshold',
+        'top_k_relevance': 'Hit if at least one retrieved document has similarity >= threshold',
+        'composite': 'Hit if (max_similarity >= threshold) AND (documents retrieved)',
+        'strict': 'Hit if max_similarity >= 0.7 (high relevance requirement)',
+        'lenient': 'Hit if max_similarity >= 0.3 (low relevance requirement)'
+    }
+
+
+def calculate_hit_rate(metrics: List[Dict], method: str = 'max_similarity', threshold: float = 0.5) -> float:
+    """
+    Calculate hit rate using different evaluation standards.
+    
+    Args:
+        metrics: List of metric dictionaries
+        method: Evaluation method to use:
+            - 'max_similarity': Hit if max_similarity >= threshold (default)
+            - 'avg_similarity': Hit if avg_similarity >= threshold
+            - 'top_k_relevance': Hit if at least one doc has similarity >= threshold
+            - 'composite': Hit if (max_similarity >= threshold) AND (num_docs > 0)
+            - 'strict': Hit if max_similarity >= 0.7 (high relevance)
+            - 'lenient': Hit if max_similarity >= 0.3 (low relevance)
+        threshold: Similarity threshold (default: 0.5)
+    
+    Returns:
+        Hit rate as a float between 0 and 1
+    """
+    if not metrics:
+        return 0.0
+    
+    hits = 0
+    for metric in metrics:
+        max_sim = metric.get('max_similarity', 0)
+        avg_sim = metric.get('avg_similarity', 0)
+        num_docs = metric.get('num_docs', 0)
+        
+        if method == 'max_similarity':
+            # Hit if maximum similarity exceeds threshold
+            hits += 1 if max_sim >= threshold else 0
+        elif method == 'avg_similarity':
+            # Hit if average similarity exceeds threshold
+            hits += 1 if avg_sim >= threshold else 0
+        elif method == 'top_k_relevance':
+            # Hit if at least one document is relevant (same as max_similarity but clearer intent)
+            hits += 1 if max_sim >= threshold else 0
+        elif method == 'composite':
+            # Hit if both max similarity is good AND documents were retrieved
+            hits += 1 if (max_sim >= threshold and num_docs > 0) else 0
+        elif method == 'strict':
+            # High relevance threshold (0.7)
+            hits += 1 if max_sim >= 0.7 else 0
+        elif method == 'lenient':
+            # Low relevance threshold (0.3)
+            hits += 1 if max_sim >= 0.3 else 0
+        else:
+            # Default to max_similarity
+            hits += 1 if max_sim >= threshold else 0
+    
+    return hits / len(metrics)
+
+
+def generate_evaluation_dashboard(metrics: List[Dict], hit_rate_method: str = 'max_similarity', 
+                                  hit_rate_threshold: float = 0.5):
+    """
+    Generate the 4-panel evaluation dashboard with response time tracking.
+    
+    Args:
+        metrics: List of metric dictionaries
+        hit_rate_method: Method for calculating hit rate ('max_similarity', 'avg_similarity', 
+                        'top_k_relevance', 'composite', 'strict', 'lenient')
+        hit_rate_threshold: Similarity threshold for hit rate calculation (default: 0.5)
+    """
     if not metrics:
         print("\n⚠️ No metrics to evaluate")
         return
 
     print("\n📊 Generating Evaluation Dashboard...")
+    print(f"📋 Using hit rate method: {hit_rate_method} (threshold: {hit_rate_threshold})")
 
     # Prepare data
     df = pd.DataFrame(metrics)
+
+    # Calculate hit rate using the specified method
+    response_rate = calculate_hit_rate(metrics, method=hit_rate_method, threshold=hit_rate_threshold)
 
     # Create figure with grey background
     fig = plt.figure(figsize=(16, 10))
@@ -30,8 +112,6 @@ def generate_evaluation_dashboard(metrics: List[Dict]):
     # ==================== TOP LEFT: Retrieval Performance Metrics ====================
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.set_facecolor('#e8f0f7')
-
-    response_rate = df['hit'].sum() / len(df)
     avg_sim = df['avg_similarity'].mean()
     max_sim = df['max_similarity'].mean()
     min_sim = df['min_similarity'].mean()
@@ -61,9 +141,10 @@ def generate_evaluation_dashboard(metrics: List[Dict]):
     query_nums = range(1, len(df) + 1)
     bars = ax2.bar(query_nums, df['avg_similarity'], color='#82c77e', edgecolor='black', linewidth=1.5)
 
-    # Add threshold line
-    threshold = 0.5
-    ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=2, label='Relevance Threshold')
+    # Add threshold line (use the hit rate threshold)
+    threshold = hit_rate_threshold
+    ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=2, 
+                label=f'Relevance Threshold ({threshold})')
 
     ax2.set_title('Average Similarity by Query', fontsize=13, fontweight='bold', pad=10)
     ax2.set_xlabel('Query Number', fontsize=11)
@@ -89,9 +170,10 @@ def generate_evaluation_dashboard(metrics: List[Dict]):
     avg_response_time = df['response_time'].mean()
     summary_text = f"""Evaluation Summary:
 • Total Queries: {len(df)}
-• Perfect Hit Rate: {response_rate*100:.1f}%
+• Hit Rate ({hit_rate_method}): {response_rate*100:.1f}%
 • Strong Similarity: {avg_sim:.3f}
-• Avg Response Time: {avg_response_time:.2f}s"""
+• Avg Response Time: {avg_response_time:.2f}s
+• Threshold: {hit_rate_threshold}"""
 
     ax3.text(0.02, 0.15, summary_text, transform=ax3.transAxes,
             fontsize=9, verticalalignment='top',
@@ -175,10 +257,18 @@ Median: {df['response_time'].median():.2f}s"""
     print("PERFORMANCE SUMMARY")
     print("="*60)
     print(f"Total Queries Processed: {len(df)}")
-    print(f"Average Response Time: {avg_time:.3f}s")
-    print(f"Fastest Response: {df['response_time'].min():.3f}s")
-    print(f"Slowest Response: {df['response_time'].max():.3f}s")
-    print(f"Median Response Time: {df['response_time'].median():.3f}s")
+    print(f"Hit Rate Method: {hit_rate_method}")
+    print(f"Hit Rate Threshold: {hit_rate_threshold}")
+    print(f"Hit Rate: {response_rate*100:.1f}%")
+    print(f"\nSimilarity Metrics:")
+    print(f"  Average Similarity: {avg_sim:.3f}")
+    print(f"  Max Similarity (avg): {max_sim:.3f}")
+    print(f"  Min Similarity (avg): {min_sim:.3f}")
+    print(f"\nResponse Time Metrics:")
+    print(f"  Average Response Time: {avg_time:.3f}s")
+    print(f"  Fastest Response: {df['response_time'].min():.3f}s")
+    print(f"  Slowest Response: {df['response_time'].max():.3f}s")
+    print(f"  Median Response Time: {df['response_time'].median():.3f}s")
     print(f"\nPerformance Distribution:")
     print(f"  Fast Queries (<2s): {fast_queries} ({fast_queries/len(df)*100:.1f}%)")
     print(f"  Medium Queries (2-5s): {medium_queries} ({medium_queries/len(df)*100:.1f}%)")

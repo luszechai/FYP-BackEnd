@@ -92,7 +92,7 @@ class AdaptiveConfig:
         
         # Ensure minimum response length
         min_tokens = 500
-        max_tokens = min(needed_tokens, 2000)  # Cap at 2000
+        max_tokens = min(needed_tokens, base_tokens)  # Cap at base_tokens (10000) to allow longer responses
         
         return max(min_tokens, max_tokens)
     

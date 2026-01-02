@@ -8,10 +8,11 @@ import json
 class LLMProvider:
     """Manages LLM API interactions with performance tracking and caching"""
 
-    def __init__(self, provider: str = "deepseek", api_key: str = None, temperature: float = 0.5, enable_cache: bool = True):
+    def __init__(self, provider: str = "deepseek", api_key: str = None, temperature: float = 0.5, 
+                 max_tokens: int = 10000, enable_cache: bool = True):
         self.provider = provider.lower()
         self.temperature = temperature  # Lower temperature (0.5) for faster, more deterministic responses
-        self.max_tokens = 600  # Reduced default for faster generation
+        self.max_tokens = max_tokens  # Allow longer responses
         self.api_key = api_key
         self.base_url = "https://api.deepseek.com"
         self.client = None
