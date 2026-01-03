@@ -10,7 +10,7 @@ class AdaptiveConfig:
     BASE_RETRIEVAL_K = 5
     BASE_MAX_TOKENS = 10000
     BASE_SIMILARITY_THRESHOLD = 0.1
-    BASE_MEMORY_HISTORY = 3
+    BASE_MEMORY_HISTORY = 6  # Increased from 3 to 5-7 range for better context retention
     
     @staticmethod
     def calculate_retrieval_k(query: str, enhanced_query: Dict) -> int:
@@ -97,15 +97,26 @@ class AdaptiveConfig:
         return max(min_tokens, max_tokens)
     
     @staticmethod
-    def calculate_memory_history_length(conversation_length: int, query_complexity: int) -> int:
+    def calculate_memory_history_length(conversation_length: int, query_complexity: int, 
+                                       has_anaphora: bool = False) -> int:
         """Automatically adjust how much conversation history to include"""
         base_history = AdaptiveConfig.BASE_MEMORY_HISTORY
         
+        # For anaphora/reference queries (pronouns, "the first one", etc.), include more history
+        if has_anaphora:
+            # Use 7-10 exchanges for reference resolution
+            if conversation_length >= 10:
+                return min(10, conversation_length)
+            elif conversation_length >= 7:
+                return 9
+            else:
+                return 8
+        
         # For longer conversations, include more history
         if conversation_length > 10:
-            return min(base_history + 2, 7)
+            return min(base_history + 2, 8)
         elif conversation_length > 5:
-            return min(base_history + 1, 5)
+            return min(base_history + 1, 7)
         else:
             return base_history
     
@@ -147,13 +158,13 @@ class AdaptiveConfig:
     
     @staticmethod
     def get_adaptive_config(query: str, enhanced_query: Dict, retrieved_docs: List[Dict], 
-                           context: str, conversation_length: int = 0) -> Dict:
+                           context: str, conversation_length: int = 0, has_anaphora: bool = False) -> Dict:
         """Get all adaptive configuration values for a query"""
         return {
             'retrieval_k': AdaptiveConfig.calculate_retrieval_k(query, enhanced_query),
             'similarity_threshold': AdaptiveConfig.calculate_similarity_threshold(query, retrieved_docs),
             'max_tokens': AdaptiveConfig.calculate_max_tokens(context, query),
-            'memory_history': AdaptiveConfig.calculate_memory_history_length(conversation_length, 0),
+            'memory_history': AdaptiveConfig.calculate_memory_history_length(conversation_length, 0, has_anaphora),
             'documents_to_use': AdaptiveConfig.calculate_documents_to_use(retrieved_docs, query),
             'should_expand': AdaptiveConfig.should_expand_query(enhanced_query)
         }

@@ -47,12 +47,14 @@ class RAGChatbot:
 
         # Get adaptive configuration
         if self.use_adaptive_config:
+            has_anaphora = enhanced_query.get('is_anaphora_query', False)
             adaptive_config = AdaptiveConfig.get_adaptive_config(
                 query=query,
                 enhanced_query=enhanced_query,
                 retrieved_docs=[],  # Will be updated after retrieval
                 context="",
-                conversation_length=len(self.memory.history)
+                conversation_length=len(self.memory.history),
+                has_anaphora=has_anaphora
             )
             # Update retriever's retrieval_k if needed
             if adaptive_config['retrieval_k'] != self.retriever.retrieval_k:
@@ -70,12 +72,14 @@ class RAGChatbot:
         # Adaptive filtering based on document quality
         if self.use_adaptive_config and retrieved_docs:
             # Recalculate with actual retrieved docs
+            has_anaphora = enhanced_query.get('is_anaphora_query', False)
             adaptive_config = AdaptiveConfig.get_adaptive_config(
                 query=query,
                 enhanced_query=enhanced_query,
                 retrieved_docs=retrieved_docs,
                 context="",
-                conversation_length=len(self.memory.history)
+                conversation_length=len(self.memory.history),
+                has_anaphora=has_anaphora
             )
             threshold = adaptive_config['similarity_threshold']
             k = adaptive_config['documents_to_use']
@@ -125,12 +129,16 @@ class RAGChatbot:
 
         # Adaptive memory history length
         if self.use_adaptive_config and use_memory:
+            # Check if query contains anaphora/references
+            enhanced_query_check = self.query_enhancer.enhance_query(query)
+            has_anaphora = enhanced_query_check.get('is_anaphora_query', False)
             adaptive_config = AdaptiveConfig.get_adaptive_config(
                 query=query,
-                enhanced_query={},
+                enhanced_query=enhanced_query_check,
                 retrieved_docs=[],
                 context=context,
-                conversation_length=len(self.memory.history)
+                conversation_length=len(self.memory.history),
+                has_anaphora=has_anaphora
             )
             memory_n = adaptive_config['memory_history']
         else:
@@ -140,12 +148,16 @@ class RAGChatbot:
 
         # Adaptive max_tokens
         if self.use_adaptive_config:
+            # Check if query contains anaphora/references
+            enhanced_query_check = self.query_enhancer.enhance_query(query)
+            has_anaphora = enhanced_query_check.get('is_anaphora_query', False)
             adaptive_config = AdaptiveConfig.get_adaptive_config(
                 query=query,
-                enhanced_query={},
+                enhanced_query=enhanced_query_check,
                 retrieved_docs=[],
                 context=context,
-                conversation_length=len(self.memory.history)
+                conversation_length=len(self.memory.history),
+                has_anaphora=has_anaphora
             )
             original_max_tokens = self.llm.max_tokens
             self.llm.max_tokens = adaptive_config['max_tokens']

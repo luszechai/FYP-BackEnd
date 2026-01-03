@@ -199,11 +199,13 @@ class QueryEnhancer:
         """Main query enhancement function"""
         is_person = self.is_person_query(query)
         is_program = self.is_program_query(query)
+        is_anaphora = self.is_anaphora_query(query)
 
         enhanced = {
             'original': query,
             'is_person_query': is_person,
             'is_program_query': is_program,
+            'is_anaphora_query': is_anaphora,
             'expanded_queries': [],
             'keywords': []
         }
@@ -224,6 +226,54 @@ class QueryEnhancer:
         enhanced['department_expanded'] = self.expand_department_query(query)
 
         return enhanced
+
+    def is_anaphora_query(self, query: str) -> bool:
+        """Detect if query contains anaphora or references (pronouns, ordinals, demonstratives)"""
+        query_lower = query.lower()
+        
+        # Pronouns that typically refer to previous context
+        pronouns = [
+            r'\b(it|its|they|them|their|this|that|these|those)\b',
+            r'\b(he|she|him|her|his|hers)\b'
+        ]
+        
+        # Ordinal references ("the first one", "the second", "the last", etc.)
+        ordinal_patterns = [
+            r'\b(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(one|option|item|program|scholarship|deadline|requirement)\b',
+            r'\b(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b',
+            r'\b(the\s+)?(last|previous|earlier|above|mentioned)\s+(one|option|item|program|scholarship|deadline|requirement)\b',
+            r'\b(the\s+)?(last|previous|earlier|above|mentioned)\b'
+        ]
+        
+        # Demonstrative references
+        demonstrative_patterns = [
+            r'\b(this|that|these|those)\s+(one|option|item|program|scholarship|deadline|requirement)\b',
+            r'\b(this|that|these|those)\b'
+        ]
+        
+        # Check for pronouns (but exclude common false positives)
+        for pattern in pronouns:
+            if re.search(pattern, query_lower):
+                # Exclude common phrases that aren't anaphora
+                if not re.search(r'\b(it\s+is|it\s+was|it\s+can|it\s+will|it\s+has|it\s+does|this\s+is|that\s+is|these\s+are|those\s+are)\b', query_lower):
+                    return True
+        
+        # Check for ordinal references
+        for pattern in ordinal_patterns:
+            if re.search(pattern, query_lower):
+                return True
+        
+        # Check for demonstrative references (more strict)
+        for pattern in demonstrative_patterns:
+            if re.search(pattern, query_lower):
+                return True
+        
+        # Very short queries (1-3 words) are often references
+        words = query_lower.split()
+        if len(words) <= 3 and any(word in ['it', 'this', 'that', 'first', 'second', 'last', 'one'] for word in words):
+            return True
+        
+        return False
 
     def categorize_query(self, query: str) -> str:
         """Categorize query into predefined categories"""

@@ -33,7 +33,8 @@ class ConversationMemory:
         formatted = "Recent conversation history:\n"
         for exchange in recent:
             formatted += f"User: {exchange['user_query']}\n"
-            formatted += f"Assistant: {exchange['bot_response'][:200]}...\n\n"
+            # Removed truncation to preserve full context for anaphora resolution
+            formatted += f"Assistant: {exchange['bot_response']}\n\n"
         return formatted
 
     def clear(self):
