@@ -25,7 +25,7 @@ CRITICAL GUIDELINES - DATA ACCURACY:
 
 Response Guidelines:
 - Answer based ONLY from the documents, without adding external information
-- Make use of the provided context and conversation history to provide accurate and relevant answers
+- Make use of the provided context and conversation history to provide accurate and relevant answers, especially for follow-up questions
 - Be specific and cite relevant information from the documents
 - For person queries, include: name, title, qualifications, office, phone, email (only if in context)
 - When answering questions about deadlines, dates, or time-sensitive information, use the current date ({dt_info['date']}) as a reference point
@@ -38,32 +38,47 @@ Response Guidelines:
 - DO NOT mention "Document X" or "Source: Document X" in your response - sources are automatically displayed separately
 - DO NOT list which documents you used - just provide the information naturally"""
 
-def build_user_prompt(query: str, context: str, dt_info: Dict[str, str]) -> str:
+def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], previous_response: str = None) -> str:
     """Build the user prompt for the LLM"""
+    previous_context = ""
+    if previous_response:
+        previous_context = f"""
+    PREVIOUS ASSISTANT RESPONSE (for resolving references):
+    {previous_response}
+    """
+    
     return f"""Based on the following admission documents and conversation history, please answer this question:
 
     Question: {query}
 
     Context from SFU Admission Documents:
-    {context}
+    {context}{previous_context}
 
     CRITICAL INSTRUCTIONS - READ CAREFULLY:
-    1. YOU MUST search through ALL the context documents above to find the answer
-    2. If the answer exists in the context (even if partially), you MUST provide it - DO NOT say "the documents do not specify"
-    3. For deadline/date questions: Carefully search for dates, deadlines, application periods in the context
-    4. If you find ANY mention of dates or deadlines in the context, you MUST include them in your answer
-    5. ONLY say "not specified" or "not found" if you have thoroughly searched ALL context documents and confirmed the information is truly absent
-    6. DO NOT use any information from your training data that is not in the context
-    7. Compare any dates, deadlines, or time-sensitive information in the context with the current date ({dt_info['date']})
-    8. When you find a deadline in the context, state it EXACTLY as written: "The deadline is [exact text from context]"
-    9. If dates in the context have passed, explicitly inform the user that the information may be outdated
-    10. If information appears outdated, DO NOT provide it to the user, unless the user asks for it explicitly.
-    11. IMPORTANT: Do NOT mention "Document X", "Source: Document X", or list which documents you used in your response
-    12. The sources are automatically displayed separately, so you don't need to reference them
+    1. ANAPHORA RESOLUTION (for references like "the first one", "it", "that", "the second"):
+       - If the user uses ordinal references ("first", "second", "the last one") or pronouns ("it", "that", "them"):
+       - FIRST check if they're referring to something from MY PREVIOUS RESPONSE in the conversation history
+       - If yes, confidently use that reference WITHOUT asking for clarification
+       - ONLY search the documents if the reference is NOT clearly from our conversation
+       - Example: If I listed 5 scholarships and user asks "details about the first one", they mean the first I listed, not the first in the documents
+    
+    2. YOU MUST search through ALL the context documents above to find the answer
+    3. If the answer exists in the context (even if partially), you MUST provide it - DO NOT say "the documents do not specify"
+    4. For deadline/date questions: Carefully search for dates, deadlines, application periods in the context
+    5. If you find ANY mention of dates or deadlines in the context, you MUST include them in your answer
+    6. ONLY say "not specified" or "not found" if you have thoroughly searched ALL context documents and confirmed the information is truly absent
+    7. DO NOT use any information from your training data that is not in the context
+    8. Compare any dates, deadlines, or time-sensitive information in the context with the current date ({dt_info['date']})
+    9. When you find a deadline in the context, state it EXACTLY as written: "The deadline is [exact text from context]"
+    10. If dates in the context have passed, explicitly inform the user that the information may be outdated
+    11. If information appears outdated, DO NOT provide it to the user, unless the user asks for it explicitly.
+    12. IMPORTANT: Do NOT mention "Document X", "Source: Document X", or list which documents you used in your response
+    13. The sources are automatically displayed separately, so you don't need to reference them
 
     VERIFICATION STEP: Before saying information is not in the documents, ask yourself:
     - Have I searched through ALL the context documents above?
     - Did I look for variations of the question (e.g., "deadline", "due date", "application date")?
     - Is there ANY mention of this information, even if phrased differently?
+    - If this is a follow-up question, did I check my previous response for relevant context?
 
     Please provide a helpful and accurate answer based ONLY on the context provided. If the information is in the context, you MUST include it."""
