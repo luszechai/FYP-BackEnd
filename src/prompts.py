@@ -1,10 +1,14 @@
-"""Prompt templates for the chatbot"""
-from typing import Dict
+"""Prompt templates for the chatbot with query-type-aware generation"""
+from typing import Dict, Optional, List, Any
+from src.query_intelligence import QueryClassification, QueryType, UserProfile
+from src.response_templates import ResponseTemplates
 
 
-def build_system_message(dt_info: Dict[str, str]) -> str:
-    """Build the system message for the LLM"""
-    return f"""You are a helpful assistant for Saint Francis University (SFU) admission inquiries.
+def build_system_message(dt_info: Dict[str, str], 
+                        classification: Optional[QueryClassification] = None) -> str:
+    """Build the system message for the LLM with optional query classification context"""
+    
+    base_message = f"""You are a helpful assistant for Saint Francis University (SFU) admission inquiries.
 You have access to official admission documents and conversation history to provide accurate information.
 
 Current Date and Time Information:
@@ -38,8 +42,74 @@ Response Guidelines:
 - DO NOT mention "Document X" or "Source: Document X" in your response - sources are automatically displayed separately
 - DO NOT list which documents you used - just provide the information naturally"""
 
-def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], previous_response: str = None) -> str:
-    """Build the user prompt for the LLM"""
+    # Add classification-aware context if available
+    if classification:
+        context_section = _build_classification_context(classification)
+        base_message += f"\n\n{context_section}"
+    
+    return base_message
+
+
+def _build_classification_context(classification: QueryClassification) -> str:
+    """Build additional system message context based on query classification"""
+    
+    sections = ["QUERY CONTEXT (use this to tailor your response):"]
+    
+    # User profile context
+    profile_descriptions = {
+        UserProfile.LOCAL_DSE: "The user appears to be a local Hong Kong student (likely JUPAS applicant). Prioritize information relevant to DSE results and JUPAS admission.",
+        UserProfile.LOCAL_NON_JUPAS: "The user appears to be applying via Non-JUPAS. Focus on direct application requirements and processes.",
+        UserProfile.INTERNATIONAL: "The user appears to be an international student. Emphasize English requirements, visa information, and international student support.",
+        UserProfile.TRANSFER: "The user appears to be a transfer student (from sub-degree/HD). Highlight articulation arrangements, credit transfer, and senior year admission.",
+        UserProfile.CURRENT_STUDENT: "The user is a current student. Focus on practical, enrolled student information.",
+        UserProfile.PROSPECTIVE: "The user is a prospective student exploring options. Provide welcoming, comprehensive information.",
+    }
+    
+    if classification.user_profile != UserProfile.UNKNOWN:
+        sections.append(f"- User Profile: {profile_descriptions.get(classification.user_profile, 'General prospective student')}")
+    
+    # Query type context
+    type_descriptions = {
+        QueryType.FACTUAL_LOOKUP: "This is a factual lookup - provide a direct, concise answer.",
+        QueryType.EXPLORATORY: "This is an exploratory question - provide a comprehensive, well-structured response with multiple sections.",
+        QueryType.COMPARATIVE: "This is a comparison question - highlight differences and provide objective analysis.",
+        QueryType.PROCEDURAL: "This is a how-to question - provide clear, step-by-step instructions.",
+        QueryType.ELIGIBILITY: "This is an eligibility question - clearly list requirements and mention alternatives if criteria aren't met.",
+        QueryType.TEMPORAL: "This is a deadline/date question - state dates clearly, indicate if passed/upcoming, include related deadlines.",
+    }
+    
+    sections.append(f"- Query Type: {type_descriptions.get(classification.query_type, 'General inquiry')}")
+    
+    # Detected intents
+    if classification.intents:
+        sections.append(f"- Detected Interests: {', '.join(classification.intents[:5])}")
+    
+    # Implicit needs / proactive info
+    if classification.implicit_needs:
+        sections.append(f"- Consider Including: {', '.join(classification.implicit_needs[:3])}")
+    
+    return "\n".join(sections)
+
+
+def _get_response_structure_guidance(classification: QueryClassification) -> str:
+    """Get response structure guidance based on query type"""
+    return ResponseTemplates.get_response_structure_prompt(
+        classification.query_type,
+        classification.user_profile
+    )
+
+
+def _get_proactive_info_guidance(classification: QueryClassification) -> str:
+    """Get guidance for proactive information inclusion"""
+    return ResponseTemplates.get_proactive_info_prompt(
+        classification.intents,
+        classification.query_type
+    )
+
+def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], 
+                      previous_response: str = None,
+                      classification: Optional[QueryClassification] = None) -> str:
+    """Build the user prompt for the LLM with optional query classification"""
     previous_context = ""
     if previous_response:
         previous_context = f"""
@@ -47,12 +117,26 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], previou
     {previous_response}
     """
     
+    # Get response structure guidance if classification is available
+    structure_guidance = ""
+    proactive_guidance = ""
+    if classification:
+        structure_guidance = f"""
+    RESPONSE STRUCTURE GUIDANCE:
+    {_get_response_structure_guidance(classification)}
+    """
+        proactive_info = _get_proactive_info_guidance(classification)
+        if proactive_info:
+            proactive_guidance = f"""
+    {proactive_info}
+    """
+    
     return f"""Based on the following admission documents and conversation history, please answer this question:
 
     Question: {query}
 
     Context from SFU Admission Documents:
-    {context}{previous_context}
+    {context}{previous_context}{structure_guidance}{proactive_guidance}
 
     CRITICAL INSTRUCTIONS - READ CAREFULLY:
     1. ANAPHORA RESOLUTION (for references like "the first one", "it", "that", "the second"):
@@ -82,3 +166,23 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], previou
     - If this is a follow-up question, did I check my previous response for relevant context?
 
     Please provide a helpful and accurate answer based ONLY on the context provided. If the information is in the context, you MUST include it."""
+
+
+def build_context_aware_prompts(query: str, context: str, dt_info: Dict[str, str],
+                                classification: QueryClassification,
+                                previous_response: str = None) -> tuple[str, str]:
+    """
+    Build both system and user prompts with full context awareness.
+    Returns (system_message, user_prompt) tuple.
+    """
+    system_message = build_system_message(dt_info, classification)
+    user_prompt = build_user_prompt(query, context, dt_info, previous_response, classification)
+    return system_message, user_prompt
+
+
+def get_follow_up_suggestion(classification: QueryClassification) -> Optional[str]:
+    """Get a contextual follow-up suggestion based on the query classification"""
+    return ResponseTemplates.format_follow_up_question(
+        classification.query_type,
+        classification.user_profile
+    )
