@@ -134,6 +134,23 @@ class HybridRetriever:
                             doc['similarity'] * 0.9
                         )
 
+        # Strategy 2.3: Expanded Role Queries (for queries like "who is the programme leader of AI")
+        if enhanced_query.get('is_role_query', False) and len(enhanced_query['expanded_queries']) > 1:
+            print(f"🔍 Strategy 2.3: Expanded role queries ({len(enhanced_query['expanded_queries'])} variations)")
+
+            for exp_query in enhanced_query['expanded_queries'][:5]:
+                results = self.db.query(query_text=exp_query, n_results=self.retrieval_k)
+                for doc in self.db.format_results(results):
+                    doc_id = doc['id']
+                    if doc_id not in all_results:
+                        all_results[doc_id] = doc
+                        all_results[doc_id]['retrieval_score'] = doc['similarity'] * 0.92
+                    else:
+                        all_results[doc_id]['retrieval_score'] = max(
+                            all_results[doc_id]['retrieval_score'],
+                            doc['similarity'] * 0.92
+                        )
+
         # Strategy 2.5: Expanded Program Queries
         if enhanced_query.get('is_program_query', False) and len(enhanced_query['expanded_queries']) > 1:
             print(f"🔍 Strategy 2.5: Expanded Program queries ({len(enhanced_query['expanded_queries'])} variations)")
@@ -173,6 +190,19 @@ class HybridRetriever:
                     else:
                         boost = min(0.3, keyword_matches * 0.1)
 
+                    doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
+
+        # Strategy 3.5: Role-specific keyword boosting
+        if enhanced_query.get('is_role_query', False):
+            print(f"🔍 Strategy 3.5: Role-specific keyword boosting")
+            role_keywords = ['programme leader', 'program leader', 'director', 'head of', 
+                           'role', 'coordinator', 'dean', 'chair']
+            for doc_id, doc in all_results.items():
+                content_lower = doc['document'].lower()
+                # Check if document contains role-related keywords
+                role_matches = sum(1 for rk in role_keywords if rk in content_lower)
+                if role_matches > 0:
+                    boost = min(0.15, role_matches * 0.05)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
         # Strategy 4: Context-based document boosting (user profile aware)
@@ -317,4 +347,3 @@ class HybridRetriever:
             'intents': classification.intents[:5],
             'expanded_queries_used': len(classification.expanded_queries)
         }
-

@@ -13,6 +13,13 @@ class QueryEnhancer:
             'faculty', 'staff', 'dean', 'head'
         ]
 
+        # Role-based titles for detecting queries about people by their position
+        self.role_titles = [
+            'programme leader', 'program leader', 'head of', 'director',
+            'dean', 'coordinator', 'chair', 'head', 'leader', 'manager',
+            'associate head', 'deputy head', 'acting head'
+        ]
+
         self.department_aliases = {
             'cis': ['computing and information sciences', 'computer science', 'cs', 'computing'],
             'it': ['information technology'],
@@ -67,6 +74,24 @@ class QueryEnhancer:
         # Return True if there are multiple capitalized words (likely a name)
         # OR if there's at least one capitalized word in the middle/end of the sentence
         return len(capitalized) >= 1
+
+    def is_role_query(self, query: str) -> bool:
+        """Detect if query is asking about a person by their role/position"""
+        query_lower = query.lower()
+        
+        # Patterns for role-based person queries
+        role_patterns = [
+            r'\bwho\s+is\s+(the\s+)?(programme|program)\s+leader\b',
+            r'\bwho\s+is\s+(the\s+)?head\s+of\b',
+            r'\bwho\s+is\s+(the\s+)?director\s+of\b',
+            r'\bwho\s+is\s+(the\s+)?dean\s+of\b',
+            r'\bwho\s+is\s+(the\s+)?coordinator\s+(of|for)\b',
+            r'\bwho\s+(leads?|runs?|manages?|heads?)\b',
+            r'\b(programme|program)\s+leader\s+of\b',
+            r'\bhead\s+of\s+(the\s+)?(department|school|programme|program)\b',
+        ]
+        
+        return any(re.search(p, query_lower) for p in role_patterns)
 
     def extract_name_components(self, query: str) -> Dict[str, List[str]]:
         """Extract potential name components from query"""
@@ -143,6 +168,75 @@ class QueryEnhancer:
 
         return list(set(queries))
 
+    def expand_role_query(self, query: str) -> List[str]:
+        """Generate query variations for role-based person searches"""
+        queries = [query]
+        query_lower = query.lower()
+        
+        # Expand program/department abbreviations (ai -> artificial intelligence)
+        for abbrev, expansions in self.department_aliases.items():
+            # Check if abbreviation is a standalone word in query
+            if re.search(r'\b' + abbrev + r'\b', query_lower):
+                for exp in expansions:
+                    expanded_query = re.sub(r'\b' + abbrev + r'\b', exp, query_lower)
+                    queries.append(expanded_query)
+        
+        # Role synonyms mapping
+        role_synonyms = {
+            'programme leader': ['program leader', 'program director', 'programme director', 'programme head'],
+            'program leader': ['programme leader', 'program director', 'programme director', 'program head'],
+            'head of': ['director of', 'chair of', 'head'],
+            'director of': ['head of', 'chair of', 'director'],
+            'coordinator': ['coordinator of', 'program coordinator', 'programme coordinator'],
+        }
+        
+        for role, synonyms in role_synonyms.items():
+            if role in query_lower:
+                for syn in synonyms:
+                    queries.append(query_lower.replace(role, syn))
+        
+        # Extract the subject/program from the query and create direct search queries
+        # e.g., "who is the programme leader of ai" -> extract "ai" or "artificial intelligence"
+        subject_match = re.search(r'(?:of|for)\s+(?:the\s+)?(.+?)(?:\s*\?|$)', query_lower)
+        if subject_match:
+            subject = subject_match.group(1).strip()
+            # Expand abbreviations in subject
+            expanded_subject = subject
+            for abbrev, expansions in self.department_aliases.items():
+                if abbrev == subject or re.search(r'\b' + abbrev + r'\b', subject):
+                    expanded_subject = expansions[0] if expansions else subject
+                    break
+            
+            # Direct role search queries that match the data format
+            queries.append(f"Programme Leader {expanded_subject}")
+            queries.append(f"Programme Leader of {expanded_subject}")
+            queries.append(f"Programme Leader of Bachelor of Science {expanded_subject}")
+            queries.append(f"role Programme Leader {expanded_subject}")
+        
+        return list(set(queries))
+
+    def _extract_role_keywords(self, query: str) -> List[str]:
+        """Extract role-related keywords from query"""
+        keywords = []
+        query_lower = query.lower()
+        
+        # Add role titles found in query
+        for role in self.role_titles:
+            if role in query_lower:
+                keywords.append(role)
+        
+        # Expand and add department/program terms
+        for abbrev, expansions in self.department_aliases.items():
+            if re.search(r'\b' + abbrev + r'\b', query_lower):
+                keywords.append(abbrev)
+                keywords.extend(expansions)
+        
+        # Add common role-related terms
+        role_terms = ['programme leader', 'program leader', 'director', 'head', 'role']
+        keywords.extend([t for t in role_terms if t in query_lower])
+        
+        return list(set(keywords))
+
     def expand_program_query(self, query: str) -> List[str]:
         """Generate variations for course/program queries"""
         queries = [query]
@@ -200,19 +294,25 @@ class QueryEnhancer:
         is_person = self.is_person_query(query)
         is_program = self.is_program_query(query)
         is_anaphora = self.is_anaphora_query(query)
+        is_role = self.is_role_query(query)
 
         enhanced = {
             'original': query,
             'is_person_query': is_person,
             'is_program_query': is_program,
             'is_anaphora_query': is_anaphora,
+            'is_role_query': is_role,
             'expanded_queries': [],
             'keywords': []
         }
 
-        # Prioritize program queries over person queries when both are detected
-        # This prevents course queries from being misclassified as person queries
-        if is_program:
+        # Prioritize role queries (asking about person by position) over generic person queries
+        # Then program queries, then person queries
+        if is_role:
+            # Role-based queries: "who is the programme leader of AI"
+            enhanced['expanded_queries'] = self.expand_role_query(query)
+            enhanced['keywords'] = self._extract_role_keywords(query)
+        elif is_program:
             enhanced['expanded_queries'] = self.expand_program_query(query)
             # Use course codes as high-value keywords
             enhanced['keywords'] = re.findall(r'\b[a-z]{2,4}\d{3,4}\b', query.lower().replace(" ", ""))
