@@ -1,10 +1,13 @@
 """Vector database management module"""
 import json
-from typing import List, Dict
+import os
+from typing import List, Dict, Optional
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from .document_loader import DocumentLoaderFactory, PDFLoader, ImageLoader
 
 
 class ChromaDBManager:
@@ -97,6 +100,185 @@ class ChromaDBManager:
         try:
             self.collection.add(ids=ids, documents=documents, metadatas=metadatas)
             print(f"✅ Successfully added {len(documents)} chunks")
+        except Exception as e:
+            print(f"❌ Error adding documents: {e}")
+            raise
+
+    def add_documents_from_pdf(
+        self,
+        pdf_path: str,
+        metadata: Optional[Dict] = None,
+        min_text_length: int = 100,
+        ocr_language: str = "eng+chi_sim+chi_tra",
+        tesseract_path: Optional[str] = None
+    ) -> int:
+        """
+        Load and add documents from a PDF file.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            metadata: Optional additional metadata to include
+            min_text_length: Minimum text length before triggering OCR
+            ocr_language: Language for OCR
+            tesseract_path: Path to Tesseract executable
+            
+        Returns:
+            Number of chunks added
+        """
+        print(f"📄 Processing PDF: {pdf_path}")
+        
+        loader = PDFLoader(
+            min_text_length=min_text_length,
+            ocr_language=ocr_language,
+            tesseract_path=tesseract_path
+        )
+        
+        documents = loader.load(pdf_path)
+        return self._add_loaded_documents(documents, metadata)
+
+    def add_documents_from_image(
+        self,
+        image_path: str,
+        metadata: Optional[Dict] = None,
+        ocr_language: str = "eng+chi_sim+chi_tra",
+        tesseract_path: Optional[str] = None
+    ) -> int:
+        """
+        Load and add documents from an image file using OCR.
+        
+        Args:
+            image_path: Path to the image file
+            metadata: Optional additional metadata to include
+            ocr_language: Language for OCR
+            tesseract_path: Path to Tesseract executable
+            
+        Returns:
+            Number of chunks added
+        """
+        print(f"🖼️ Processing image: {image_path}")
+        
+        loader = ImageLoader(
+            ocr_language=ocr_language,
+            tesseract_path=tesseract_path
+        )
+        
+        documents = loader.load(image_path)
+        return self._add_loaded_documents(documents, metadata)
+
+    def add_documents_from_directory(
+        self,
+        directory: str,
+        extensions: Optional[List[str]] = None,
+        recursive: bool = False,
+        metadata: Optional[Dict] = None,
+        min_text_length: int = 100,
+        ocr_language: str = "eng+chi_sim+chi_tra",
+        tesseract_path: Optional[str] = None
+    ) -> int:
+        """
+        Load and add all supported documents from a directory.
+        
+        Args:
+            directory: Path to the directory
+            extensions: Optional list of extensions to filter (e.g., ['.pdf', '.png'])
+            recursive: Whether to search subdirectories
+            metadata: Optional additional metadata to include
+            min_text_length: Minimum text length before triggering OCR for PDFs
+            ocr_language: Language for OCR
+            tesseract_path: Path to Tesseract executable
+            
+        Returns:
+            Number of chunks added
+        """
+        print(f"📁 Processing directory: {directory}")
+        
+        factory = DocumentLoaderFactory(
+            min_text_length=min_text_length,
+            ocr_language=ocr_language,
+            tesseract_path=tesseract_path
+        )
+        
+        documents = factory.load_directory(
+            directory=directory,
+            extensions=extensions,
+            recursive=recursive
+        )
+        
+        return self._add_loaded_documents(documents, metadata)
+
+    def _add_loaded_documents(
+        self,
+        documents: List[Dict],
+        extra_metadata: Optional[Dict] = None
+    ) -> int:
+        """
+        Internal method to add loaded documents to the database.
+        
+        Args:
+            documents: List of documents with 'content' and 'metadata' keys
+            extra_metadata: Optional additional metadata to merge
+            
+        Returns:
+            Number of chunks added
+        """
+        if not documents:
+            print("⚠️ No documents to add")
+            return 0
+        
+        ids, texts, metadatas = [], [], []
+        
+        for i, doc in enumerate(documents):
+            content = doc.get('content', '').strip()
+            if not content:
+                continue
+            
+            # Split content into chunks
+            chunks = self.text_splitter.split_text(content)
+            doc_metadata = doc.get('metadata', {})
+            
+            for j, chunk in enumerate(chunks):
+                # Generate unique chunk ID
+                chunk_id = f"{doc_metadata.get('type', 'doc')}_{doc_metadata.get('parent_doc_id', i)}_chunk_{j}_{hash(chunk[:50]) % 1000000}"
+                ids.append(chunk_id)
+                texts.append(chunk)
+                
+                # Build metadata
+                chunk_metadata = {
+                    'source': doc_metadata.get('source', ''),
+                    'type': doc_metadata.get('type', 'document'),
+                    'extraction_method': doc_metadata.get('extraction_method', 'unknown'),
+                    'chunk_index': j,
+                    'total_chunks': len(chunks),
+                    'parent_doc_id': doc_metadata.get('parent_doc_id', f'doc_{i}'),
+                }
+                
+                # Add page info for PDFs
+                if 'page' in doc_metadata:
+                    chunk_metadata['page'] = doc_metadata['page']
+                    chunk_metadata['total_pages'] = doc_metadata.get('total_pages', 1)
+                
+                # Add image info
+                if 'image_size' in doc_metadata:
+                    chunk_metadata['image_size'] = doc_metadata['image_size']
+                if 'format' in doc_metadata:
+                    chunk_metadata['format'] = doc_metadata['format']
+                
+                # Merge extra metadata if provided
+                if extra_metadata:
+                    chunk_metadata.update(extra_metadata)
+                
+                metadatas.append(chunk_metadata)
+        
+        if not texts:
+            print("⚠️ No text content to add after processing")
+            return 0
+        
+        print(f"🚀 Adding {len(texts)} chunks to ChromaDB...")
+        
+        try:
+            self.collection.add(ids=ids, documents=texts, metadatas=metadatas)
+            print(f"✅ Successfully added {len(texts)} chunks")
+            return len(texts)
         except Exception as e:
             print(f"❌ Error adding documents: {e}")
             raise

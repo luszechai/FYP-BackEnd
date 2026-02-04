@@ -1,6 +1,6 @@
 """Configuration module for the SFU Admission Chatbot"""
 import os
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -46,6 +46,20 @@ class Config:
     
     # Source URL Configuration
     SOURCE_BASE_URL: str = os.getenv("SOURCE_BASE_URL", "https://www.sfu.edu.hk")
+    
+    # OCR Configuration
+    # Path to Tesseract executable (Windows default, update if installed elsewhere)
+    # Download from: https://github.com/UB-Mannheim/tesseract/wiki
+    TESSERACT_PATH: Optional[str] = os.getenv(
+        "TESSERACT_PATH"
+    )
+    # OCR language: eng=English, chi_sim=Chinese Simplified, chi_tra=Chinese Traditional
+    # Use + to combine languages, e.g., "eng+chi_sim+chi_tra"
+    OCR_LANGUAGE: str = os.getenv("OCR_LANGUAGE", "eng+chi_sim+chi_tra")
+    MIN_TEXT_LENGTH_FOR_OCR: int = 100  # Trigger OCR if extracted text is shorter
+    
+    # Document Processing Configuration
+    SUPPORTED_EXTENSIONS: List[str] = [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"]
     
     @classmethod
     def validate(cls):
