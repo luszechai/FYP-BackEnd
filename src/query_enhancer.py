@@ -93,6 +93,110 @@ class QueryEnhancer:
         
         return any(re.search(p, query_lower) for p in role_patterns)
 
+    def is_scholarship_query(self, query: str) -> bool:
+        """Detect if query is about scholarships"""
+        query_lower = query.lower()
+        scholarship_patterns = [
+            r'\bscholarship[s]?\b',
+            r'\bfinancial\s+(aid|assistance|support)\b',
+            r'\bbursary|bursaries\b',
+            r'\bgrant[s]?\b.*\b(student|academic)\b',
+            r'\b(academic|merit|need[- ]based)\s+award[s]?\b',
+        ]
+        return any(re.search(p, query_lower) for p in scholarship_patterns)
+
+    def _extract_scholarship_keywords(self, query: str) -> List[str]:
+        """Extract scholarship-related keywords from query"""
+        keywords = []
+        query_lower = query.lower()
+        
+        # Core scholarship terms
+        scholarship_terms = [
+            'scholarship', 'scholarships', 'bursary', 'bursaries', 
+            'financial aid', 'grant', 'grants', 'award', 'awards',
+            'academic achievement', 'merit', 'need-based'
+        ]
+        
+        for term in scholarship_terms:
+            if term in query_lower:
+                keywords.append(term)
+        
+        # Add data format keywords that match the dataset
+        keywords.extend(['scholarship_name', 'entrance_scholarships', 'admission_scholarships'])
+        
+        # Check for listing intent
+        list_patterns = ['list', 'what', 'which', 'available', 'types of', 
+                        'show', 'tell me', 'give me', 'all']
+        if any(p in query_lower for p in list_patterns):
+            keywords.extend(['scholarships available', 'available scholarships'])
+        
+        # Check for eligibility/criteria questions
+        if any(term in query_lower for term in ['eligible', 'eligibility', 'qualify', 'criteria', 'requirement']):
+            keywords.extend(['eligibility', 'criteria', 'requirements'])
+        
+        return list(set(keywords))
+
+    def expand_scholarship_query(self, query: str) -> List[str]:
+        """Generate query variations for scholarship searches"""
+        queries = [query]
+        query_lower = query.lower()
+        
+        # Check if this is a listing query (asking for available scholarships)
+        list_patterns = ['list', 'what', 'which', 'available', 'types of', 
+                        'show', 'tell me', 'give me', 'all', 'any']
+        is_list_query = any(p in query_lower for p in list_patterns)
+        
+        if is_list_query:
+            # Add queries that match the data format in the dataset
+            queries.extend([
+                "scholarship_name",
+                "scholarships available",
+                "entrance scholarships",
+                "admission scholarships",
+                "Academic Achievement Scholarships",
+                "available scholarships for students",
+                "scholarship eligibility criteria",
+                "types of scholarships",
+                "scholarship opportunities"
+            ])
+        
+        # Add general scholarship search terms
+        queries.extend([
+            "scholarship",
+            "scholarships offered",
+            "financial aid scholarships",
+            "scholarship program"
+        ])
+        
+        # Check for specific scholarship types mentioned
+        if 'academic' in query_lower or 'achievement' in query_lower:
+            queries.append("Academic Achievement Scholarships AAS")
+        if 'admission' in query_lower or 'entrance' in query_lower:
+            queries.extend(["Admission Scholarships", "entrance scholarships"])
+        if 'merit' in query_lower:
+            queries.append("merit-based scholarships")
+        if 'need' in query_lower or 'financial' in query_lower:
+            queries.extend(["need-based scholarships", "financial aid"])
+        
+        # Check for deadline/date questions
+        if any(term in query_lower for term in ['deadline', 'due', 'when', 'date']):
+            queries.extend([
+                "scholarship deadline",
+                "scholarship application deadline",
+                "scholarship due date"
+            ])
+        
+        # Check for eligibility questions
+        if any(term in query_lower for term in ['eligible', 'eligibility', 'qualify', 'criteria', 'requirement', 'how to']):
+            queries.extend([
+                "scholarship eligibility",
+                "scholarship requirements",
+                "scholarship criteria",
+                "how to apply for scholarship"
+            ])
+        
+        return list(set(queries))
+
     def extract_name_components(self, query: str) -> Dict[str, List[str]]:
         """Extract potential name components from query"""
         stop_words = {
@@ -295,6 +399,7 @@ class QueryEnhancer:
         is_program = self.is_program_query(query)
         is_anaphora = self.is_anaphora_query(query)
         is_role = self.is_role_query(query)
+        is_scholarship = self.is_scholarship_query(query)
 
         enhanced = {
             'original': query,
@@ -302,16 +407,21 @@ class QueryEnhancer:
             'is_program_query': is_program,
             'is_anaphora_query': is_anaphora,
             'is_role_query': is_role,
+            'is_scholarship_query': is_scholarship,
             'expanded_queries': [],
             'keywords': []
         }
 
         # Prioritize role queries (asking about person by position) over generic person queries
-        # Then program queries, then person queries
+        # Then scholarship queries, program queries, then person queries
         if is_role:
             # Role-based queries: "who is the programme leader of AI"
             enhanced['expanded_queries'] = self.expand_role_query(query)
             enhanced['keywords'] = self._extract_role_keywords(query)
+        elif is_scholarship:
+            # Scholarship queries: "what scholarships are available", "list of scholarships"
+            enhanced['expanded_queries'] = self.expand_scholarship_query(query)
+            enhanced['keywords'] = self._extract_scholarship_keywords(query)
         elif is_program:
             enhanced['expanded_queries'] = self.expand_program_query(query)
             # Use course codes as high-value keywords
