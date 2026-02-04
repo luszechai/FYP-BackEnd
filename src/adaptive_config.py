@@ -91,7 +91,7 @@ class AdaptiveConfig:
         needed_tokens = int((base_response_tokens + query_tokens) * complexity_multiplier)
         
         # Ensure minimum response length
-        min_tokens = 500
+        min_tokens = 1000
         max_tokens = min(needed_tokens, base_tokens)  # Cap at base_tokens (10000) to allow longer responses
         
         return max(min_tokens, max_tokens)
