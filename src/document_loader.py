@@ -5,6 +5,17 @@ import hashlib
 from typing import List, Dict, Optional, Tuple
 from abc import ABC, abstractmethod
 
+
+def _resolve_tesseract_path(path: str) -> str:
+    """Resolve a Tesseract path that may be a directory or executable to the actual executable path."""
+    if not path:
+        return path
+    if os.path.isdir(path):
+        exe_path = os.path.join(path, "tesseract.exe")
+        if os.path.isfile(exe_path):
+            return exe_path
+    return path
+
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
@@ -77,7 +88,7 @@ class PDFLoader(DocumentLoader):
         self.ocr_language = ocr_language
         
         if tesseract_path and TESSERACT_AVAILABLE:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            pytesseract.pytesseract.tesseract_cmd = _resolve_tesseract_path(tesseract_path)
     
     def load(self, file_path: str) -> List[Dict]:
         """
@@ -194,7 +205,7 @@ class ImageLoader(DocumentLoader):
         self.ocr_language = ocr_language
         
         if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            pytesseract.pytesseract.tesseract_cmd = _resolve_tesseract_path(tesseract_path)
     
     def load(self, file_path: str) -> List[Dict]:
         """
@@ -608,6 +619,10 @@ def check_dependencies() -> Dict[str, bool]:
     
     # Check if Tesseract executable is accessible
     if TESSERACT_AVAILABLE:
+        # Try to configure tesseract path from environment/config before checking
+        _configured_path = os.environ.get("TESSERACT_PATH", "")
+        if _configured_path and pytesseract.pytesseract.tesseract_cmd == "tesseract":
+            pytesseract.pytesseract.tesseract_cmd = _resolve_tesseract_path(_configured_path)
         try:
             pytesseract.get_tesseract_version()
             status['tesseract_executable'] = True
