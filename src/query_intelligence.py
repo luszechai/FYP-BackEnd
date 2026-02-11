@@ -1,3 +1,20 @@
+# ======================================================================
+# ██████  ███████ ██████  ██████  ███████  ██████  █████  ████████ ███████ ██████  
+# ██   ██ ██      ██   ██ ██   ██ ██      ██      ██   ██    ██    ██      ██   ██ 
+# ██   ██ █████   ██████  ██████  █████   ██      ███████    ██    █████   ██   ██ 
+# ██   ██ ██      ██      ██   ██ ██      ██      ██   ██    ██    ██      ██   ██ 
+# ██████  ███████ ██      ██   ██ ███████  ██████ ██   ██    ██    ███████ ██████  
+#
+# THIS MODULE IS DISABLED -- DO NOT IMPORT
+#
+# This module was part of the "Query Intelligence" feature (commit f4d8c36)
+# which has been reverted. All code below is commented out and inactive.
+#
+# If you need to re-enable this feature, remove the triple-quote wrapping
+# below and restore the imports in chatbot.py, retrieval.py, and prompts.py.
+# ======================================================================
+
+'''
 """Query Intelligence Module - Unified query understanding for smart retrieval and response generation"""
 import re
 from typing import Dict, List, Optional, Any
@@ -46,45 +63,45 @@ class QueryClassifier:
         # Patterns for each query type
         self.type_patterns = {
             QueryType.FACTUAL_LOOKUP: [
-                r'\b(email|phone|contact|office|room|location)\b',
-                r'\b(what is|what\'s)\s+(the|a)?\s*(email|phone|address|name|title)',
-                r'\bwho\s+is\b',
-                r'\b(cost|price|fee|tuition)\s+(of|for)\b',
-                r'\bhow\s+much\s+(is|does|are)\b',
+                r'\\b(email|phone|contact|office|room|location)\\b',
+                r'\\b(what is|what\'s)\\s+(the|a)?\\s*(email|phone|address|name|title)',
+                r'\\bwho\\s+is\\b',
+                r'\\b(cost|price|fee|tuition)\\s+(of|for)\\b',
+                r'\\bhow\\s+much\\s+(is|does|are)\\b',
             ],
             QueryType.EXPLORATORY: [
-                r'\b(tell me about|what about|overview|explain|describe)\b',
-                r'\b(acceptance rate|admission rate|competitiveness)\b',
-                r'\bhow\s+(does|is|are)\s+.*\b(work|like|good|popular)\b',
-                r'\bwhat\s+(are|is)\s+(the\s+)?(benefits|advantages|features|characteristics)\b',
-                r'\b(career|job|employment)\s+(prospects|opportunities|outlook)\b',
+                r'\\b(tell me about|what about|overview|explain|describe)\\b',
+                r'\\b(acceptance rate|admission rate|competitiveness)\\b',
+                r'\\bhow\\s+(does|is|are)\\s+.*\\b(work|like|good|popular)\\b',
+                r'\\bwhat\\s+(are|is)\\s+(the\\s+)?(benefits|advantages|features|characteristics)\\b',
+                r'\\b(career|job|employment)\\s+(prospects|opportunities|outlook)\\b',
             ],
             QueryType.COMPARATIVE: [
-                r'\b(compare|comparison|vs|versus|difference|between|or)\b',
-                r'\b(better|worse|prefer|recommend)\b',
-                r'\bwhich\s+(one|program|course|option)\b',
-                r'\b(a|b|option\s*1|option\s*2)\s+(vs|or|versus)\b',
+                r'\\b(compare|comparison|vs|versus|difference|between|or)\\b',
+                r'\\b(better|worse|prefer|recommend)\\b',
+                r'\\bwhich\\s+(one|program|course|option)\\b',
+                r'\\b(a|b|option\\s*1|option\\s*2)\\s+(vs|or|versus)\\b',
             ],
             QueryType.PROCEDURAL: [
-                r'\bhow\s+(to|do|can|should)\s+\w+\b',
-                r'\bsteps?\s+(to|for)\b',
-                r'\bprocess\s+(of|for|to)\b',
-                r'\b(apply|application|register|enroll)\b',
-                r'\bwhat\s+(do|should)\s+i\s+(do|need)\b',
+                r'\\bhow\\s+(to|do|can|should)\\s+\\w+\\b',
+                r'\\bsteps?\\s+(to|for)\\b',
+                r'\\bprocess\\s+(of|for|to)\\b',
+                r'\\b(apply|application|register|enroll)\\b',
+                r'\\bwhat\\s+(do|should)\\s+i\\s+(do|need)\\b',
             ],
             QueryType.ELIGIBILITY: [
-                r'\b(can|could|am)\s+i\b',
-                r'\b(eligible|eligibility|qualify|qualification)\b',
-                r'\b(requirement|requirements|needed|need)\b',
-                r'\b(minimum|required)\s+(grade|gpa|score|marks)\b',
-                r'\bdo\s+i\s+(need|have|qualify)\b',
+                r'\\b(can|could|am)\\s+i\\b',
+                r'\\b(eligible|eligibility|qualify|qualification)\\b',
+                r'\\b(requirement|requirements|needed|need)\\b',
+                r'\\b(minimum|required)\\s+(grade|gpa|score|marks)\\b',
+                r'\\bdo\\s+i\\s+(need|have|qualify)\\b',
             ],
             QueryType.TEMPORAL: [
-                r'\b(deadline|due\s+date|by\s+when|when\s+is)\b',
-                r'\b(start|end|open|close|begins?|ends?)\s+(date|time)\b',
-                r'\bwhen\s+(does|do|is|are|can)\b',
-                r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b',
-                r'\b(semester|term|academic\s+year)\b.*\b(start|end|begin)\b',
+                r'\\b(deadline|due\\s+date|by\\s+when|when\\s+is)\\b',
+                r'\\b(start|end|open|close|begins?|ends?)\\s+(date|time)\\b',
+                r'\\bwhen\\s+(does|do|is|are|can)\\b',
+                r'\\b(january|february|march|april|may|june|july|august|september|october|november|december)\\b',
+                r'\\b(semester|term|academic\\s+year)\\b.*\\b(start|end|begin)\\b',
             ],
         }
         
@@ -490,3 +507,4 @@ class QueryIntelligence:
             'context_boost_terms': classification.context_boost_terms,
             'response_guidelines': classification.response_guidelines
         }
+'''

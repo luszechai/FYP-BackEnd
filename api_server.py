@@ -43,8 +43,6 @@ class ChatResponse(BaseModel):
     performance: Dict
     sources: List[Dict]
     enhanced_query: Dict
-    query_intelligence: Optional[Dict] = None
-    suggested_follow_up: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
@@ -215,9 +213,7 @@ async def chat(request: ChatRequest):
             query=response['query'],
             performance=performance,
             sources=sources,
-            enhanced_query=response.get('enhanced_query', {}),
-            query_intelligence=response.get('query_intelligence'),
-            suggested_follow_up=response.get('suggested_follow_up')
+            enhanced_query=response.get('enhanced_query', {})
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
@@ -225,7 +221,7 @@ async def chat(request: ChatRequest):
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """Process a chat query with streaming response and context-aware features"""
+    """Process a chat query with streaming response"""
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
     
@@ -234,16 +230,11 @@ async def chat_stream(request: ChatRequest):
     
     async def generate():
         try:
-            # Retrieve context first with query intelligence
-            retrieved_docs, context, enhanced_query, query_classification = chatbot_instance.retrieve_context(
+            # Retrieve context first
+            retrieved_docs, context, enhanced_query = chatbot_instance.retrieve_context(
                 request.query, 
                 use_memory=request.use_memory
             )
-            
-            # Send query intelligence info at the start
-            if query_classification:
-                qi_data = chatbot_instance.query_intelligence.to_dict(query_classification)
-                yield f"data: {json.dumps({'type': 'query_intelligence', 'data': qi_data})}\n\n"
             
             if not context:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'No relevant information found'})}\n\n"
@@ -256,27 +247,17 @@ async def chat_stream(request: ChatRequest):
             else:
                 conversation_history = None
             
-            # Get system message with context awareness
+            # Get system message
             from src.utils import get_current_datetime_info
-            from src.prompts import build_system_message, build_user_prompt, build_context_aware_prompts, get_follow_up_suggestion
+            from src.prompts import build_system_message, build_user_prompt
             
             dt_info = get_current_datetime_info()
             
             # Get user file context for prompt injection
             user_file_context = chatbot_instance.format_session_file_context() if chatbot_instance.session_files else None
 
-            # Use context-aware prompts if classification is available
-            if query_classification and chatbot_instance.use_query_intelligence:
-                system_message, user_prompt = build_context_aware_prompts(
-                    query=request.query,
-                    context=context,
-                    dt_info=dt_info,
-                    classification=query_classification,
-                    user_file_context=user_file_context
-                )
-            else:
-                system_message = build_system_message(dt_info)
-                user_prompt = build_user_prompt(request.query, context, dt_info, user_file_context=user_file_context)
+            system_message = build_system_message(dt_info)
+            user_prompt = build_user_prompt(request.query, context, dt_info, user_file_context=user_file_context)
             
             # Stream response
             full_response = ""
@@ -295,20 +276,8 @@ async def chat_stream(request: ChatRequest):
                 [doc['id'] for doc in retrieved_docs]
             )
             
-            # Build completion data
-            completion_data = {
-                'type': 'done', 
-                'full_response': full_response
-            }
-            
-            # Add follow-up suggestion if available
-            if query_classification:
-                follow_up = get_follow_up_suggestion(query_classification)
-                if follow_up:
-                    completion_data['suggested_follow_up'] = follow_up
-            
             # Send completion
-            yield f"data: {json.dumps(completion_data)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response})}\n\n"
             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -597,4 +566,3 @@ async def get_evaluation_methods():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

@@ -1,3 +1,20 @@
+# ======================================================================
+# ██████  ███████ ██████  ██████  ███████  ██████  █████  ████████ ███████ ██████  
+# ██   ██ ██      ██   ██ ██   ██ ██      ██      ██   ██    ██    ██      ██   ██ 
+# ██   ██ █████   ██████  ██████  █████   ██      ███████    ██    █████   ██   ██ 
+# ██   ██ ██      ██      ██   ██ ██      ██      ██   ██    ██    ██      ██   ██ 
+# ██████  ███████ ██      ██   ██ ███████  ██████ ██   ██    ██    ███████ ██████  
+#
+# THIS MODULE IS DISABLED -- DO NOT IMPORT
+#
+# This module was part of the "Query Intelligence" feature (commit f4d8c36)
+# which has been reverted. All code below is commented out and inactive.
+#
+# If you need to re-enable this feature, remove the triple-quote wrapping
+# below and restore the imports in chatbot.py, retrieval.py, and prompts.py.
+# ======================================================================
+
+'''
 """Response Templates Module - Structured response templates for each query type"""
 from typing import Dict, List, Any, Optional
 from src.query_intelligence import QueryType, UserProfile
@@ -315,11 +332,11 @@ class ResponseTemplates:
         
         # Add profile-specific guidance
         tone_guidance = {
-            'encouraging': "\n- Use an encouraging and supportive tone",
-            'detailed_and_clear': "\n- Provide extra clarity for complex terms\n- Avoid local jargon that international students may not know",
-            'informative': "\n- Focus on practical, actionable information",
-            'concise': "\n- Keep response brief and to the point",
-            'welcoming': "\n- Use a welcoming tone to prospective students"
+            'encouraging': "\\n- Use an encouraging and supportive tone",
+            'detailed_and_clear': "\\n- Provide extra clarity for complex terms\\n- Avoid local jargon that international students may not know",
+            'informative': "\\n- Focus on practical, actionable information",
+            'concise': "\\n- Keep response brief and to the point",
+            'welcoming': "\\n- Use a welcoming tone to prospective students"
         }
         
         profile_tone = profile_adj.get('tone', 'professional')
@@ -327,10 +344,10 @@ class ResponseTemplates:
         
         # Add max length guidance
         length_guidance = {
-            'short': "\n- Keep response under 150 words",
-            'moderate': "\n- Aim for 150-300 words",
-            'detailed': "\n- Provide detailed response (300-500 words)",
-            'comprehensive': "\n- Provide comprehensive coverage (400-600 words)"
+            'short': "\\n- Keep response under 150 words",
+            'moderate': "\\n- Aim for 150-300 words",
+            'detailed': "\\n- Provide detailed response (300-500 words)",
+            'comprehensive': "\\n- Provide comprehensive coverage (400-600 words)"
         }
         base_prompt += length_guidance.get(template['max_length'], length_guidance['moderate'])
         
@@ -342,7 +359,7 @@ class ResponseTemplates:
         if not intents:
             return ""
         
-        prompt_parts = ["\nProactive Information to Include:"]
+        prompt_parts = ["\\nProactive Information to Include:"]
         
         for intent in intents[:3]:  # Limit to top 3
             template = cls.get_proactive_info_template(intent)
@@ -357,7 +374,7 @@ class ResponseTemplates:
             prompt_parts.append("- Offer to provide more details on specific aspects")
         
         if len(prompt_parts) > 1:
-            return "\n".join(prompt_parts)
+            return "\\n".join(prompt_parts)
         return ""
 
     @classmethod
@@ -394,12 +411,12 @@ class ResponseFormatter:
     @staticmethod
     def format_bullet_list(items: List[str], prefix: str = "- ") -> str:
         """Format a list of items as bullet points"""
-        return "\n".join(f"{prefix}{item}" for item in items)
+        return "\\n".join(f"{prefix}{item}" for item in items)
     
     @staticmethod
     def format_numbered_list(items: List[str]) -> str:
         """Format a list of items as numbered list"""
-        return "\n".join(f"{i+1}. {item}" for i, item in enumerate(items))
+        return "\\n".join(f"{i+1}. {item}" for i, item in enumerate(items))
     
     @staticmethod
     def format_comparison_table(headers: List[str], rows: List[List[str]]) -> str:
@@ -427,7 +444,7 @@ class ResponseFormatter:
             data_row = " | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row))
             lines.append(f"| {data_row} |")
         
-        return "\n".join(lines)
+        return "\\n".join(lines)
     
     @staticmethod
     def format_deadline_status(deadline_date: str, current_date: str, is_passed: bool) -> str:
@@ -442,4 +459,5 @@ class ResponseFormatter:
         """Wrap content in a titled section"""
         if not content.strip():
             return ""
-        return f"**{title}**\n{content}\n"
+        return f"**{title}**\\n{content}\\n"
+'''
