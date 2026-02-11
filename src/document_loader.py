@@ -1,5 +1,6 @@
-"""Document loader module for PDF and image files with OCR support"""
+"""Document loader module for PDF, image, text, CSV, and DOCX files with OCR support"""
 import os
+import csv
 import hashlib
 from typing import List, Dict, Optional, Tuple
 from abc import ABC, abstractmethod
@@ -22,6 +23,12 @@ try:
     PDF2IMAGE_AVAILABLE = True
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
+
+try:
+    import docx as python_docx
+    PYTHON_DOCX_AVAILABLE = True
+except ImportError:
+    PYTHON_DOCX_AVAILABLE = False
 
 
 class DocumentLoader(ABC):
@@ -246,6 +253,200 @@ class ImageLoader(DocumentLoader):
             raise Exception(f"Error loading image {file_path}: {e}")
 
 
+class TextFileLoader(DocumentLoader):
+    """
+    Loader for plain text files (.txt).
+    Reads the file content directly.
+    """
+    
+    SUPPORTED_EXTENSIONS = {'.txt'}
+    
+    def load(self, file_path: str) -> List[Dict]:
+        """
+        Load a text file and return its content.
+        
+        Args:
+            file_path: Path to the text file
+            
+        Returns:
+            List with single document containing the file text and metadata
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Text file not found: {file_path}")
+        
+        doc_id = self.generate_doc_id(file_path)
+        
+        print(f"📝 Loading text file: {os.path.basename(file_path)}")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+        except UnicodeDecodeError:
+            # Fallback to latin-1 if utf-8 fails
+            with open(file_path, 'r', encoding='latin-1') as f:
+                text = f.read().strip()
+        
+        if not text:
+            print(f"  ⚠️ Text file is empty")
+            return []
+        
+        print(f"  ✅ Read {len(text)} characters")
+        
+        return [{
+            'content': text,
+            'metadata': {
+                'source': file_path,
+                'type': 'text',
+                'format': 'txt',
+                'extraction_method': 'direct_read',
+                'parent_doc_id': doc_id
+            }
+        }]
+
+
+class CSVLoader(DocumentLoader):
+    """
+    Loader for CSV files (.csv).
+    Reads CSV rows and converts them to readable text.
+    """
+    
+    SUPPORTED_EXTENSIONS = {'.csv'}
+    
+    def load(self, file_path: str) -> List[Dict]:
+        """
+        Load a CSV file and convert rows to readable text.
+        
+        Args:
+            file_path: Path to the CSV file
+            
+        Returns:
+            List with single document containing the CSV content as text
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"CSV file not found: {file_path}")
+        
+        doc_id = self.generate_doc_id(file_path)
+        
+        print(f"📊 Loading CSV file: {os.path.basename(file_path)}")
+        
+        try:
+            rows = []
+            with open(file_path, 'r', encoding='utf-8', newline='') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                
+                if headers is None:
+                    print(f"  ⚠️ CSV file is empty")
+                    return []
+                
+                row_count = 0
+                for row in reader:
+                    if row:
+                        # Convert each row to "header: value" pairs
+                        row_text = ", ".join(
+                            f"{headers[i]}: {row[i]}" 
+                            for i in range(min(len(headers), len(row)))
+                            if row[i].strip()
+                        )
+                        if row_text:
+                            rows.append(row_text)
+                            row_count += 1
+            
+            if not rows:
+                print(f"  ⚠️ No data rows found in CSV")
+                return []
+            
+            text = f"Headers: {', '.join(headers)}\n\n" + "\n".join(rows)
+            print(f"  ✅ Read {row_count} rows, {len(text)} characters")
+            
+            return [{
+                'content': text,
+                'metadata': {
+                    'source': file_path,
+                    'type': 'csv',
+                    'format': 'csv',
+                    'extraction_method': 'csv_reader',
+                    'parent_doc_id': doc_id,
+                    'row_count': row_count,
+                    'columns': headers
+                }
+            }]
+            
+        except Exception as e:
+            raise Exception(f"Error loading CSV {file_path}: {e}")
+
+
+class DocxLoader(DocumentLoader):
+    """
+    Loader for DOCX files (.docx).
+    Uses python-docx library to extract text from Word documents.
+    """
+    
+    SUPPORTED_EXTENSIONS = {'.docx'}
+    
+    def __init__(self):
+        if not PYTHON_DOCX_AVAILABLE:
+            raise ImportError(
+                "python-docx is required for .docx support. "
+                "Install with: pip install python-docx"
+            )
+    
+    def load(self, file_path: str) -> List[Dict]:
+        """
+        Load a DOCX file and extract text from all paragraphs.
+        
+        Args:
+            file_path: Path to the DOCX file
+            
+        Returns:
+            List with single document containing the extracted text and metadata
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"DOCX file not found: {file_path}")
+        
+        doc_id = self.generate_doc_id(file_path)
+        
+        print(f"📄 Loading DOCX file: {os.path.basename(file_path)}")
+        
+        try:
+            doc = python_docx.Document(file_path)
+            
+            paragraphs = []
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    paragraphs.append(text)
+            
+            # Also extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if row_text:
+                        paragraphs.append(row_text)
+            
+            if not paragraphs:
+                print(f"  ⚠️ No text extracted from DOCX")
+                return []
+            
+            text = "\n\n".join(paragraphs)
+            print(f"  ✅ Extracted {len(text)} characters from {len(paragraphs)} paragraphs")
+            
+            return [{
+                'content': text,
+                'metadata': {
+                    'source': file_path,
+                    'type': 'docx',
+                    'format': 'docx',
+                    'extraction_method': 'python_docx',
+                    'parent_doc_id': doc_id,
+                    'paragraph_count': len(paragraphs)
+                }
+            }]
+            
+        except Exception as e:
+            raise Exception(f"Error loading DOCX {file_path}: {e}")
+
+
 class DocumentLoaderFactory:
     """
     Factory class that auto-detects file type and returns appropriate loader.
@@ -253,6 +454,9 @@ class DocumentLoaderFactory:
     
     PDF_EXTENSIONS = {'.pdf'}
     IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'}
+    TEXT_EXTENSIONS = {'.txt'}
+    CSV_EXTENSIONS = {'.csv'}
+    DOCX_EXTENSIONS = {'.docx'}
     
     def __init__(
         self,
@@ -295,11 +499,20 @@ class DocumentLoaderFactory:
                 ocr_language=self.ocr_language,
                 tesseract_path=self.tesseract_path
             )
+        elif ext in self.TEXT_EXTENSIONS:
+            return TextFileLoader()
+        elif ext in self.CSV_EXTENSIONS:
+            return CSVLoader()
+        elif ext in self.DOCX_EXTENSIONS:
+            return DocxLoader()
         else:
             raise ValueError(
                 f"Unsupported file type: {ext}. "
                 f"Supported: PDF ({', '.join(self.PDF_EXTENSIONS)}), "
-                f"Images ({', '.join(self.IMAGE_EXTENSIONS)})"
+                f"Images ({', '.join(self.IMAGE_EXTENSIONS)}), "
+                f"Text ({', '.join(self.TEXT_EXTENSIONS)}), "
+                f"CSV ({', '.join(self.CSV_EXTENSIONS)}), "
+                f"DOCX ({', '.join(self.DOCX_EXTENSIONS)})"
             )
     
     def load(self, file_path: str) -> List[Dict]:
@@ -337,7 +550,7 @@ class DocumentLoaderFactory:
         
         # Default to all supported extensions
         if extensions is None:
-            extensions = list(self.PDF_EXTENSIONS | self.IMAGE_EXTENSIONS)
+            extensions = list(self.PDF_EXTENSIONS | self.IMAGE_EXTENSIONS | self.TEXT_EXTENSIONS | self.CSV_EXTENSIONS | self.DOCX_EXTENSIONS)
         
         # Normalize extensions
         extensions = [ext.lower() if ext.startswith('.') else f'.{ext.lower()}' 
@@ -390,6 +603,7 @@ def check_dependencies() -> Dict[str, bool]:
         'pymupdf': PYMUPDF_AVAILABLE,
         'pytesseract': TESSERACT_AVAILABLE,
         'pdf2image': PDF2IMAGE_AVAILABLE,
+        'python_docx': PYTHON_DOCX_AVAILABLE,
     }
     
     # Check if Tesseract executable is accessible

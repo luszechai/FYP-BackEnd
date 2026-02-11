@@ -1,6 +1,7 @@
 """RAG chatbot module with query intelligence integration"""
 import time
 import numpy as np
+from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
 from src.query_enhancer import QueryEnhancer
 from src.memory import ConversationMemory
@@ -36,6 +37,12 @@ class RAGChatbot:
         # Initialize metrics tracking
         self.session_metrics = []
         
+        # Session file storage for user-uploaded documents
+        self.session_files: List[Dict] = []
+        self.MAX_SESSION_FILES = 5
+        self.MAX_FILE_CHARS = 15000
+        self.MAX_TOTAL_FILE_CONTEXT = 30000
+        
         # Store last classification for use in streaming
         self.last_classification: Optional[QueryClassification] = None
 
@@ -44,6 +51,83 @@ class RAGChatbot:
             print("✅ Adaptive configuration enabled - parameters will adjust automatically")
         if use_query_intelligence:
             print("✅ Query intelligence enabled - context-aware responses active")
+
+    # ---- Session file management ----
+
+    def add_session_file(self, file_id: str, filename: str, content: str) -> None:
+        """Add an uploaded file to the session file store"""
+        if len(self.session_files) >= self.MAX_SESSION_FILES:
+            raise ValueError(f"Maximum of {self.MAX_SESSION_FILES} session files reached. Remove a file before uploading a new one.")
+        
+        # Truncate content if needed
+        truncated = False
+        if len(content) > self.MAX_FILE_CHARS:
+            content = content[:self.MAX_FILE_CHARS]
+            truncated = True
+        
+        self.session_files.append({
+            'id': file_id,
+            'filename': filename,
+            'content': content,
+            'uploaded_at': datetime.now().isoformat(),
+            'truncated': truncated
+        })
+        print(f"📎 Session file added: {filename} ({len(content)} chars, truncated={truncated})")
+
+    def remove_session_file(self, file_id: str) -> bool:
+        """Remove a session file by ID. Returns True if found and removed."""
+        for i, f in enumerate(self.session_files):
+            if f['id'] == file_id:
+                removed = self.session_files.pop(i)
+                print(f"🗑️ Session file removed: {removed['filename']}")
+                return True
+        return False
+
+    def get_session_files(self) -> List[Dict]:
+        """Return metadata-only list of uploaded session files"""
+        return [
+            {
+                'id': f['id'],
+                'filename': f['filename'],
+                'uploaded_at': f['uploaded_at'],
+                'char_count': len(f['content']),
+                'truncated': f['truncated']
+            }
+            for f in self.session_files
+        ]
+
+    def clear_session_files(self) -> None:
+        """Remove all session files"""
+        count = len(self.session_files)
+        self.session_files.clear()
+        print(f"🧹 Cleared {count} session file(s)")
+
+    def format_session_file_context(self) -> str:
+        """
+        Format all uploaded session file text into a context string.
+        Enforces per-file and total character limits.
+        """
+        if not self.session_files:
+            return ""
+        
+        parts = []
+        total_chars = 0
+        
+        for f in self.session_files:
+            content = f['content']
+            remaining = self.MAX_TOTAL_FILE_CONTEXT - total_chars
+            if remaining <= 0:
+                parts.append(f"[File: {f['filename']}] (omitted — total context limit reached)")
+                break
+            if len(content) > remaining:
+                content = content[:remaining] + "... [truncated due to total limit]"
+            
+            parts.append(f"[File: {f['filename']}]\n{content}")
+            total_chars += len(content)
+        
+        return "\n\n---\n\n".join(parts)
+
+    # ---- Retrieval ----
 
     def retrieve_context(self, query: str, use_memory: bool = True, 
                          query_classification: Optional[QueryClassification] = None) -> Tuple[List[Dict], str, Dict, Optional[QueryClassification]]:
@@ -156,6 +240,14 @@ class RAGChatbot:
             context_parts = context_parts[:min(len(context_parts), 6)]
             context_string = "\n\n---\n\n".join(context_parts)
         
+        # Append session file context if any files are uploaded
+        session_file_context = self.format_session_file_context()
+        if session_file_context:
+            if context_string:
+                context_string += "\n\n--- USER-UPLOADED DOCUMENTS ---\n\n" + session_file_context
+            else:
+                context_string = session_file_context
+        
         return top_results, context_string, enhanced_query, query_classification
 
     def generate_response(self, query: str, context: str, use_memory: bool = True,
@@ -164,18 +256,22 @@ class RAGChatbot:
         # Get current date and time information
         dt_info = get_current_datetime_info()
         
+        # Get user file context for prompt injection
+        user_file_context = self.format_session_file_context() if self.session_files else None
+
         # Build prompts using prompt templates with classification context
         if self.use_query_intelligence and query_classification:
             system_message, user_prompt = build_context_aware_prompts(
                 query=query,
                 context=context,
                 dt_info=dt_info,
-                classification=query_classification
+                classification=query_classification,
+                user_file_context=user_file_context
             )
             print(f"📝 Using context-aware prompts for {query_classification.query_type.value} query")
         else:
             system_message = build_system_message(dt_info)
-            user_prompt = build_user_prompt(query, context, dt_info)
+            user_prompt = build_user_prompt(query, context, dt_info, user_file_context=user_file_context)
 
         # Adaptive memory history length
         if self.use_adaptive_config and use_memory:

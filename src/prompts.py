@@ -40,7 +40,8 @@ Response Guidelines:
 - Be friendly and professional
 - Keep responses concise but complete
 - DO NOT mention "Document X" or "Source: Document X" in your response - sources are automatically displayed separately
-- DO NOT list which documents you used - just provide the information naturally"""
+- DO NOT list which documents you used - just provide the information naturally
+- The user may attach their own documents. When user-uploaded documents are provided, use them alongside the admission documents to answer questions."""
 
     # Add classification-aware context if available
     if classification:
@@ -108,8 +109,9 @@ def _get_proactive_info_guidance(classification: QueryClassification) -> str:
 
 def build_user_prompt(query: str, context: str, dt_info: Dict[str, str], 
                       previous_response: str = None,
-                      classification: Optional[QueryClassification] = None) -> str:
-    """Build the user prompt for the LLM with optional query classification"""
+                      classification: Optional[QueryClassification] = None,
+                      user_file_context: Optional[str] = None) -> str:
+    """Build the user prompt for the LLM with optional query classification and user-uploaded file context"""
     previous_context = ""
     if previous_response:
         previous_context = f"""
@@ -131,12 +133,26 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
     {proactive_info}
     """
     
+    # Build user-uploaded documents section
+    user_file_section = ""
+    if user_file_context:
+        user_file_section = f"""
+
+    IMPORTANT: The user has uploaded their own documents (shown below under "User-Uploaded Documents").
+    If the query is brief or could relate to these uploaded files, focus your answer on analyzing
+    the content of the user-uploaded documents. Only fall back to admission documents if the query
+    clearly asks about admissions.
+
+    User-Uploaded Documents:
+    {user_file_context}
+    """
+    
     return f"""Based on the following admission documents and conversation history, please answer this question:
 
     Question: {query}
 
     Context from SFU Admission Documents:
-    {context}{previous_context}{structure_guidance}{proactive_guidance}
+    {context}{user_file_section}{previous_context}{structure_guidance}{proactive_guidance}
 
     CRITICAL INSTRUCTIONS - READ CAREFULLY:
     1. ANAPHORA RESOLUTION (for references like "the first one", "it", "that", "the second"):
@@ -170,13 +186,14 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
 
 def build_context_aware_prompts(query: str, context: str, dt_info: Dict[str, str],
                                 classification: QueryClassification,
-                                previous_response: str = None) -> tuple[str, str]:
+                                previous_response: str = None,
+                                user_file_context: Optional[str] = None) -> tuple[str, str]:
     """
     Build both system and user prompts with full context awareness.
     Returns (system_message, user_prompt) tuple.
     """
     system_message = build_system_message(dt_info, classification)
-    user_prompt = build_user_prompt(query, context, dt_info, previous_response, classification)
+    user_prompt = build_user_prompt(query, context, dt_info, previous_response, classification, user_file_context)
     return system_message, user_prompt
 
 

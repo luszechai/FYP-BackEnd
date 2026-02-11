@@ -1,14 +1,17 @@
 """FastAPI server for SFU Admission Chatbot"""
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import os
+import uuid
+import tempfile
 import pandas as pd
 from src.chatbot import RAGChatbot
 from src.llm_provider import LLMProvider
 from src.vector_db import ChromaDBManager
+from src.document_loader import DocumentLoaderFactory
 from src.evaluation import calculate_hit_rate, generate_evaluation_dashboard, get_available_evaluation_methods
 from config import Config
 import json
@@ -259,17 +262,21 @@ async def chat_stream(request: ChatRequest):
             
             dt_info = get_current_datetime_info()
             
+            # Get user file context for prompt injection
+            user_file_context = chatbot_instance.format_session_file_context() if chatbot_instance.session_files else None
+
             # Use context-aware prompts if classification is available
             if query_classification and chatbot_instance.use_query_intelligence:
                 system_message, user_prompt = build_context_aware_prompts(
                     query=request.query,
                     context=context,
                     dt_info=dt_info,
-                    classification=query_classification
+                    classification=query_classification,
+                    user_file_context=user_file_context
                 )
             else:
                 system_message = build_system_message(dt_info)
-                user_prompt = build_user_prompt(request.query, context, dt_info)
+                user_prompt = build_user_prompt(request.query, context, dt_info, user_file_context=user_file_context)
             
             # Stream response
             full_response = ""
@@ -317,8 +324,113 @@ async def clear_memory():
     
     chatbot_instance.memory.clear()
     chatbot_instance.session_metrics = []
+    chatbot_instance.clear_session_files()
     
-    return {"message": "Memory and metrics cleared successfully"}
+    return {"message": "Memory, metrics, and session files cleared successfully"}
+
+
+# ---- File Upload Endpoints ----
+
+ALLOWED_UPLOAD_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.txt', '.csv', '.docx'}
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file, extract text, and store in session"""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    # Validate file extension
+    _, ext = os.path.splitext(file.filename or "")
+    ext = ext.lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {ext}. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
+        )
+    
+    # Check session file limit
+    if len(chatbot_instance.session_files) >= chatbot_instance.MAX_SESSION_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum of {chatbot_instance.MAX_SESSION_FILES} files allowed. Remove a file before uploading."
+        )
+    
+    # Read and validate file size
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB."
+        )
+    
+    # Save to temp file for processing
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+        
+        # Extract text using DocumentLoaderFactory
+        loader = DocumentLoaderFactory()
+        documents = loader.load(tmp_path)
+        
+        if not documents:
+            raise HTTPException(status_code=400, detail="Could not extract any text from the file.")
+        
+        # Combine all extracted text
+        extracted_text = "\n\n".join(doc['content'] for doc in documents)
+        
+        # Generate a unique file ID
+        file_id = str(uuid.uuid4())[:8]
+        
+        # Store in chatbot session
+        chatbot_instance.add_session_file(file_id, file.filename, extracted_text)
+        
+        # Build preview (first 200 chars)
+        preview = extracted_text[:200] + ("..." if len(extracted_text) > 200 else "")
+        
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "size": len(contents),
+            "text_length": len(extracted_text),
+            "preview": preview,
+            "truncated": len(extracted_text) > chatbot_instance.MAX_FILE_CHARS
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    finally:
+        # Clean up temp file
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.delete("/api/upload/{file_id}")
+async def remove_uploaded_file(file_id: str):
+    """Remove a specific uploaded file from the session"""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    removed = chatbot_instance.remove_session_file(file_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"File with id '{file_id}' not found")
+    
+    return {"message": f"File '{file_id}' removed successfully"}
+
+
+@app.get("/api/upload")
+async def list_uploaded_files():
+    """List all currently uploaded session files (metadata only)"""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    files = chatbot_instance.get_session_files()
+    return {"files": files, "count": len(files), "max_files": chatbot_instance.MAX_SESSION_FILES}
 
 
 @app.get("/api/history", response_model=HistoryResponse)
