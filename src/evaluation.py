@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional
 from datetime import datetime
+import os
+import json
 
 
 def get_available_evaluation_methods() -> Dict[str, str]:
@@ -75,16 +77,40 @@ def calculate_hit_rate(metrics: List[Dict], method: str = 'max_similarity', thre
     return hits / len(metrics)
 
 
-def generate_evaluation_dashboard(metrics: List[Dict], hit_rate_method: str = 'max_similarity', 
-                                  hit_rate_threshold: float = 0.5):
+def _load_ragas_results(ragas_results_path: str = "eval_results.json") -> Optional[Dict]:
     """
-    Generate the 4-panel evaluation dashboard with response time tracking.
+    Attempt to load Ragas evaluation results from disk.
+    Returns None if file does not exist or is invalid.
+    """
+    if not os.path.exists(ragas_results_path):
+        return None
+    try:
+        with open(ragas_results_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Basic validation: expect 'aggregate' key
+        if "aggregate" in data:
+            return data
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def generate_evaluation_dashboard(metrics: List[Dict], hit_rate_method: str = 'max_similarity', 
+                                  hit_rate_threshold: float = 0.5,
+                                  ragas_results_path: str = "eval_results.json"):
+    """
+    Generate the evaluation dashboard with response time tracking.
+    
+    When Ragas evaluation results are available (eval_results.json), a 5th panel
+    is added showing context_precision, context_recall, faithfulness, and
+    answer_relevancy scores.
     
     Args:
         metrics: List of metric dictionaries
         hit_rate_method: Method for calculating hit rate ('max_similarity', 'avg_similarity', 
                         'top_k_relevance', 'composite', 'strict', 'lenient')
         hit_rate_threshold: Similarity threshold for hit rate calculation (default: 0.5)
+        ragas_results_path: Path to Ragas evaluation results JSON (default: eval_results.json)
     """
     if not metrics:
         print("\n⚠️ No metrics to evaluate")
@@ -93,21 +119,29 @@ def generate_evaluation_dashboard(metrics: List[Dict], hit_rate_method: str = 'm
     print("\n📊 Generating Evaluation Dashboard...")
     print(f"📋 Using hit rate method: {hit_rate_method} (threshold: {hit_rate_threshold})")
 
+    # Check for Ragas results
+    ragas_data = _load_ragas_results(ragas_results_path)
+    has_ragas = ragas_data is not None
+    if has_ragas:
+        print("📊 Ragas evaluation results detected – adding Ragas metrics panel")
+
     # Prepare data
     df = pd.DataFrame(metrics)
 
     # Calculate hit rate using the specified method
     response_rate = calculate_hit_rate(metrics, method=hit_rate_method, threshold=hit_rate_threshold)
 
-    # Create figure with grey background
-    fig = plt.figure(figsize=(16, 10))
-    fig.patch.set_facecolor('#b8c9d9')
-
-    # Main title
-    fig.suptitle('SFU Chatbot RAG Evaluation Results', fontsize=18, fontweight='bold', y=0.98)
-
-    # Create 2x2 grid with specific spacing
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25, left=0.08, right=0.95, top=0.93, bottom=0.07)
+    # Create figure – use 3 rows when Ragas data is present
+    if has_ragas:
+        fig = plt.figure(figsize=(16, 15))
+        fig.patch.set_facecolor('#b8c9d9')
+        fig.suptitle('SFU Chatbot RAG Evaluation Results', fontsize=18, fontweight='bold', y=0.98)
+        gs = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.25, left=0.08, right=0.95, top=0.94, bottom=0.05)
+    else:
+        fig = plt.figure(figsize=(16, 10))
+        fig.patch.set_facecolor('#b8c9d9')
+        fig.suptitle('SFU Chatbot RAG Evaluation Results', fontsize=18, fontweight='bold', y=0.98)
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25, left=0.08, right=0.95, top=0.93, bottom=0.07)
 
     # ==================== TOP LEFT: Retrieval Performance Metrics ====================
     ax1 = fig.add_subplot(gs[0, 0])
@@ -246,6 +280,83 @@ Median: {df['response_time'].median():.2f}s"""
             fontsize=8, verticalalignment='top', horizontalalignment='right',
             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
 
+    # ==================== ROW 3: Ragas Evaluation Metrics (if available) ====================
+    if has_ragas:
+        aggregate = ragas_data.get("aggregate", {})
+        per_question = ragas_data.get("per_question", [])
+
+        # --- Left panel: Ragas aggregate scores bar chart ---
+        ax5 = fig.add_subplot(gs[2, 0])
+        ax5.set_facecolor('#e8f0f7')
+
+        ragas_metric_names = list(aggregate.keys())
+        ragas_metric_values = [aggregate[k] for k in ragas_metric_names]
+        ragas_colors = ['#2ecc71', '#3498db', '#9b59b6', '#e67e22']
+        # Extend colours if there are more metrics
+        while len(ragas_colors) < len(ragas_metric_names):
+            ragas_colors.append('#95a5a6')
+
+        ragas_bars = ax5.bar(
+            ragas_metric_names,
+            ragas_metric_values,
+            color=ragas_colors[:len(ragas_metric_names)],
+            edgecolor='black',
+            linewidth=1.5,
+        )
+        for bar, value in zip(ragas_bars, ragas_metric_values):
+            height = bar.get_height()
+            ax5.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height,
+                f'{value:.4f}',
+                ha='center',
+                va='bottom',
+                fontweight='bold',
+                fontsize=10,
+            )
+
+        ax5.set_title('Ragas Evaluation Metrics (Aggregate)', fontsize=13, fontweight='bold', pad=10)
+        ax5.set_ylabel('Score', fontsize=11)
+        ax5.set_ylim(0, 1.1)
+        ax5.grid(axis='y', alpha=0.3, color='white', linewidth=1.5)
+        ax5.tick_params(axis='x', rotation=15)
+
+        # --- Right panel: per-question Ragas score distribution ---
+        ax6 = fig.add_subplot(gs[2, 1])
+        ax6.set_facecolor('#e8f0f7')
+
+        if per_question:
+            pq_df = pd.DataFrame(per_question)
+            # Pick numeric metric columns
+            score_cols = [c for c in pq_df.columns if c in aggregate]
+            if score_cols:
+                pq_df_scores = pq_df[score_cols].apply(pd.to_numeric, errors='coerce')
+                bp = ax6.boxplot(
+                    [pq_df_scores[col].dropna().values for col in score_cols],
+                    labels=score_cols,
+                    patch_artist=True,
+                    medianprops=dict(color='black', linewidth=2),
+                )
+                for patch, color in zip(bp['boxes'], ragas_colors[:len(score_cols)]):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.6)
+
+        # Add summary text
+        ragas_summary_lines = [f"Ragas Results ({len(per_question)} questions):"]
+        for name, val in aggregate.items():
+            ragas_summary_lines.append(f"  {name}: {val:.4f}")
+        ragas_summary = "\n".join(ragas_summary_lines)
+        ax6.text(
+            0.98, 0.97, ragas_summary, transform=ax6.transAxes,
+            fontsize=9, verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7),
+        )
+
+        ax6.set_title('Ragas Score Distribution (Per Question)', fontsize=13, fontweight='bold', pad=10)
+        ax6.set_ylabel('Score', fontsize=11)
+        ax6.set_ylim(0, 1.1)
+        ax6.grid(axis='y', alpha=0.3, color='white', linewidth=1.5)
+
     # Save
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"rag_evaluation_{timestamp}.png"
@@ -273,6 +384,13 @@ Median: {df['response_time'].median():.2f}s"""
     print(f"  Fast Queries (<2s): {fast_queries} ({fast_queries/len(df)*100:.1f}%)")
     print(f"  Medium Queries (2-5s): {medium_queries} ({medium_queries/len(df)*100:.1f}%)")
     print(f"  Slow Queries (≥5s): {slow_queries} ({slow_queries/len(df)*100:.1f}%)")
+
+    if has_ragas:
+        print(f"\nRagas Evaluation Metrics:")
+        for name, val in ragas_data.get("aggregate", {}).items():
+            print(f"  {name}: {val:.4f}")
+        print(f"  Questions Evaluated: {len(ragas_data.get('per_question', []))}")
+
     print("="*60)
 
     plt.show()

@@ -13,9 +13,18 @@ from src.llm_provider import LLMProvider
 from src.vector_db import ChromaDBManager
 from src.document_loader import DocumentLoaderFactory
 from src.evaluation import calculate_hit_rate, generate_evaluation_dashboard, get_available_evaluation_methods
+from src.ragas_evaluation import (
+    load_testset,
+    run_pipeline_on_testset,
+    evaluate_with_ragas,
+    format_results_summary,
+    save_results,
+    load_results,
+)
 from config import Config
 import json
 import time
+import asyncio
 
 app = FastAPI(title="SFU Admission Chatbot API", version="1.0.0")
 
@@ -561,6 +570,137 @@ async def evaluate(
 async def get_evaluation_methods():
     """Get available evaluation methods"""
     return get_available_evaluation_methods()
+
+
+# ---- Ragas Evaluation Endpoints ----
+
+@app.post("/api/ragas/evaluate")
+async def ragas_evaluate(
+    testset_path: str = "eval_testset.json",
+    max_questions: Optional[int] = None,
+    output_path: str = "eval_results.json",
+):
+    """
+    Trigger a Ragas evaluation run using the saved testset.
+
+    Query params:
+        testset_path: Path to the testset JSON file (default: eval_testset.json)
+        max_questions: Limit evaluation to the first N questions (for quick runs)
+        output_path: Where to save the results JSON (default: eval_results.json)
+
+    Returns:
+        JSON with aggregate metrics and per-question breakdown.
+    """
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+
+    try:
+        # Load testset
+        testset = load_testset(testset_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Testset file not found: {testset_path}. Run generate_testset.py first.",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        # Run pipeline (this is CPU/IO-heavy; run in a thread to avoid blocking)
+        loop = asyncio.get_event_loop()
+        pipeline_results = await loop.run_in_executor(
+            None,
+            lambda: run_pipeline_on_testset(chatbot_instance, testset, max_questions),
+        )
+
+        if not pipeline_results:
+            raise HTTPException(status_code=500, detail="No results from pipeline run.")
+
+        # Evaluate with Ragas
+        eval_results = await loop.run_in_executor(
+            None,
+            lambda: evaluate_with_ragas(pipeline_results),
+        )
+
+        # Save results
+        save_results(eval_results, output_path)
+
+        return {
+            "status": "success",
+            "questions_evaluated": len(pipeline_results),
+            "aggregate": eval_results.get("aggregate", {}),
+            "per_question": eval_results.get("per_question", []),
+            "results_saved_to": output_path,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ragas evaluation error: {str(e)}")
+
+
+@app.get("/api/ragas/results")
+async def ragas_results(results_path: str = "eval_results.json"):
+    """
+    Return the latest saved Ragas evaluation results.
+
+    Query params:
+        results_path: Path to the results JSON (default: eval_results.json)
+
+    Returns:
+        The full evaluation results JSON (aggregate + per-question breakdown).
+    """
+    results = load_results(results_path)
+    if results is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No evaluation results found at {results_path}. Run /api/ragas/evaluate or run_ragas_evaluation.py first.",
+        )
+    return results
+
+
+@app.get("/api/ragas/testset")
+async def ragas_testset(testset_path: str = "eval_testset.json"):
+    """
+    Return metadata about the current evaluation testset.
+
+    Query params:
+        testset_path: Path to the testset JSON (default: eval_testset.json)
+
+    Returns:
+        Testset metadata: question count, sample questions, etc.
+    """
+    try:
+        testset = load_testset(testset_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Testset not found at {testset_path}. Run generate_testset.py first.",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Build summary metadata
+    categories: dict = {}
+    for item in testset:
+        cat = item.get("category", item.get("metadata", {}).get("category", "unknown"))
+        categories[cat] = categories.get(cat, 0) + 1
+
+    # Sample questions (first 5)
+    sample_questions = [
+        {
+            "question": item.get("user_input", item.get("question", "")),
+            "has_reference": bool(item.get("reference") or item.get("ground_truth")),
+        }
+        for item in testset[:5]
+    ]
+
+    return {
+        "total_questions": len(testset),
+        "categories": categories,
+        "sample_questions": sample_questions,
+        "testset_path": testset_path,
+    }
 
 
 if __name__ == "__main__":
