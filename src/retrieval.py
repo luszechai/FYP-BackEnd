@@ -199,10 +199,43 @@ class HybridRetriever:
                     boost = min(0.15, role_matches * 0.05)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
-        sorted_results = sorted(all_results.values(),
+        deduplicated = self._deduplicate_results(list(all_results.values()))
+        sorted_results = sorted(deduplicated,
                               key=lambda x: x['retrieval_score'],
                               reverse=True)
 
         # Return more results for scholarship queries
         max_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
         return sorted_results[:max_results]
+
+    def _deduplicate_results(self, results: List[Dict]) -> List[Dict]:
+        """Two-layer dedup: parent_doc_id then content similarity."""
+        # Layer 1: Keep best chunk per parent_doc_id
+        by_parent = {}
+        for doc in results:
+            pid = doc['metadata'].get('parent_doc_id', doc['id'])
+            if pid not in by_parent or doc['retrieval_score'] > by_parent[pid]['retrieval_score']:
+                by_parent[pid] = doc
+
+        unique_docs = list(by_parent.values())
+
+        # Layer 2: Content-based dedup for cross-URL duplicates
+        final = []
+        seen_content = []
+        for doc in sorted(unique_docs, key=lambda x: x['retrieval_score'], reverse=True):
+            snippet = doc['document'][:200].strip().lower()
+            is_dup = any(self._text_overlap(snippet, s) > 0.9 for s in seen_content)
+            if not is_dup:
+                final.append(doc)
+                seen_content.append(snippet)
+
+        return final
+
+    @staticmethod
+    def _text_overlap(a: str, b: str) -> float:
+        """Word-level Jaccard similarity between two text snippets."""
+        words_a = set(a.split())
+        words_b = set(b.split())
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / len(words_a | words_b)
