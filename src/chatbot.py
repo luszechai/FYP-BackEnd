@@ -102,8 +102,9 @@ class RAGChatbot:
         
         parts = []
         total_chars = 0
+        reversed_files = list(reversed(self.session_files))
         
-        for f in self.session_files:
+        for i, f in enumerate(reversed_files):
             content = f['content']
             remaining = self.MAX_TOTAL_FILE_CONTEXT - total_chars
             if remaining <= 0:
@@ -112,7 +113,12 @@ class RAGChatbot:
             if len(content) > remaining:
                 content = content[:remaining] + "... [truncated due to total limit]"
             
-            parts.append(f"[File: {f['filename']}]\n{content}")
+            if i == 0:
+                label = f"[MOST RECENT UPLOAD: {f['filename']}]"
+            else:
+                label = f"[Earlier Upload: {f['filename']}]"
+            
+            parts.append(f"{label}\n{content}")
             total_chars += len(content)
         
         return "\n\n---\n\n".join(parts)

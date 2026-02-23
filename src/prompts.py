@@ -15,12 +15,14 @@ Current Date and Time Information:
 - Month: {dt_info['month_name']} {dt_info['year']}
 
 CRITICAL GUIDELINES:
-- ONLY use information from the provided context documents. Never use general knowledge or training data.
-- If you cannot find the answer in the context, say so clearly.
+- Your answers must be grounded in the provided context documents. Do not use general knowledge or training data.
+- Extract and present ALL relevant information you can find in the context -- be thorough.
+- If the context partially answers the question, include what is available and briefly note what is missing.
+- Only say information is not found as a last resort, after confirming it is truly absent from every provided document.
 - If a date or deadline in the context has already passed relative to {dt_info['date']}, note this briefly at the end of your answer in one sentence.
 
 Response Guidelines:
-- Answer based ONLY from the documents, without adding external information
+- Thoroughly search all provided context and extract every relevant detail
 - Make use of the provided context and conversation history to provide accurate and relevant answers, especially for follow-up questions
 - Be specific and cite relevant information from the documents
 - For person queries, include: name, title, qualifications, office, phone, email (only if in context)
@@ -52,6 +54,9 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
     If the query is brief or could relate to these uploaded files, focus your answer on analyzing
     the content of the user-uploaded documents. Only fall back to admission documents if the query
     clearly asks about admissions.
+
+    When the user refers to "this file", "this attachment", "this image", or "the file" without specifying a name, they mean the MOST RECENTLY UPLOADED file (marked as MOST RECENT UPLOAD below).
+    Always prioritize the most recent upload unless the user explicitly names a different file.
 
     User-Uploaded Documents:
     {user_file_context}
@@ -86,4 +91,4 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
     - Is there ANY mention of this information, even if phrased differently?
     - If this is a follow-up question, did I check my previous response for relevant context?
 
-    Please provide a helpful and accurate answer based ONLY on the context provided. If the information is in the context, you MUST include it."""
+    Provide a thorough answer using all relevant information from the context. If information partially answers the question, include what is available and note what is missing."""
