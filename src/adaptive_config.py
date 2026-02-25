@@ -12,6 +12,10 @@ class AdaptiveConfig:
     BASE_SIMILARITY_THRESHOLD = 0.1
     BASE_MEMORY_HISTORY = 6  # Increased from 3 to 5-7 range for better context retention
     
+    # Reranker configuration
+    RERANKER_CANDIDATE_MULTIPLIER = 3  # Fetch this many times more candidates for reranking
+    RERANKER_BASE_TOP_K = 8  # Default number of documents to keep after reranking
+    
     @staticmethod
     def calculate_retrieval_k(query: str, enhanced_query: Dict) -> int:
         """Automatically determine how many documents to retrieve"""
@@ -143,6 +147,31 @@ class AdaptiveConfig:
             return base_k
     
     @staticmethod
+    def calculate_reranker_top_k(query: str, enhanced_query: Dict, retrieved_docs: List[Dict]) -> int:
+        """Determine how many documents to keep after reranking."""
+        base_top_k = AdaptiveConfig.RERANKER_BASE_TOP_K
+        
+        # Scholarship/deadline queries benefit from more documents
+        if is_scholarship_query(query) or is_deadline_query(query):
+            base_top_k += 3
+        
+        # Person queries may need fewer but more precise results
+        if enhanced_query.get('is_person_query', False):
+            base_top_k = max(5, base_top_k - 1)
+        
+        # Program queries — keep a moderate pool
+        if enhanced_query.get('is_program_query', False):
+            base_top_k += 1
+        
+        # If we have many high-quality candidates, keep more
+        if retrieved_docs:
+            high_quality = sum(1 for d in retrieved_docs if d.get('retrieval_score', 0) > 0.5)
+            if high_quality > base_top_k:
+                base_top_k = min(high_quality, 12)
+        
+        return min(base_top_k, 15)
+
+    @staticmethod
     def should_expand_query(enhanced_query: Dict) -> bool:
         """Determine if query expansion is needed"""
         # Always expand person/program queries
@@ -166,6 +195,7 @@ class AdaptiveConfig:
             'max_tokens': AdaptiveConfig.calculate_max_tokens(context, query),
             'memory_history': AdaptiveConfig.calculate_memory_history_length(conversation_length, 0, has_anaphora),
             'documents_to_use': AdaptiveConfig.calculate_documents_to_use(retrieved_docs, query),
-            'should_expand': AdaptiveConfig.should_expand_query(enhanced_query)
+            'should_expand': AdaptiveConfig.should_expand_query(enhanced_query),
+            'reranker_top_k': AdaptiveConfig.calculate_reranker_top_k(query, enhanced_query, retrieved_docs),
         }
 

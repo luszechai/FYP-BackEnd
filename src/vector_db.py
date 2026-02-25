@@ -1,6 +1,7 @@
 """Vector database management module"""
 import json
 import os
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 import chromadb
 from chromadb.config import Settings
@@ -8,6 +9,8 @@ from chromadb.utils import embedding_functions
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .document_loader import DocumentLoaderFactory, PDFLoader, ImageLoader
+# text_cleaner disabled -- was stripping useful content during ingestion
+# from .text_cleaner import clean_text
 
 
 class ChromaDBManager:
@@ -88,10 +91,10 @@ class ChromaDBManager:
                     'total_chunks': len(chunks),
                     'parent_doc_id': f"doc_{i}",
                     'structured': doc_metadata.get('structured', False),
-                    # Preserve URL information if available
                     'url': doc_metadata.get('url', ''),
                     'link': doc_metadata.get('link', ''),
                     'source_url': doc_metadata.get('source_url', ''),
+                    'ingested_at': datetime.now(tz=timezone.utc).isoformat(),
                 }
                 metadatas.append(metadata)
 
@@ -232,7 +235,6 @@ class ChromaDBManager:
             if not content:
                 continue
             
-            # Split content into chunks
             chunks = self.text_splitter.split_text(content)
             doc_metadata = doc.get('metadata', {})
             
@@ -242,7 +244,6 @@ class ChromaDBManager:
                 ids.append(chunk_id)
                 texts.append(chunk)
                 
-                # Build metadata
                 chunk_metadata = {
                     'source': doc_metadata.get('source', ''),
                     'type': doc_metadata.get('type', 'document'),
@@ -250,6 +251,9 @@ class ChromaDBManager:
                     'chunk_index': j,
                     'total_chunks': len(chunks),
                     'parent_doc_id': doc_metadata.get('parent_doc_id', f'doc_{i}'),
+                    'file_modified_at': doc_metadata.get('file_modified_at', ''),
+                    'ingested_at': doc_metadata.get('ingested_at',
+                                                     datetime.now(tz=timezone.utc).isoformat()),
                 }
                 
                 # Add page info for PDFs

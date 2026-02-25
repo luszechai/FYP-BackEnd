@@ -8,26 +8,46 @@ from src.memory import ConversationMemory
 from src.vector_db import ChromaDBManager
 from src.llm_provider import LLMProvider
 from src.retrieval import HybridRetriever
+from src.reranker import Reranker
+from src.bm25_search import BM25Search
 from src.prompts import build_system_message, build_user_prompt
 from src.utils import get_current_datetime_info, is_deadline_query, should_skip_retrieval
 from src.adaptive_config import AdaptiveConfig
+from src.query_rewriter import rewrite_query
+from src.context_compressor import compress_context
 
 
 class RAGChatbot:
     """RAG-based chatbot with performance tracking"""
 
     def __init__(self, chroma_db: ChromaDBManager, llm_provider: LLMProvider, 
-                 use_adaptive_config: bool = True):
+                 use_adaptive_config: bool = True, use_reranker: bool = True):
         self.db = chroma_db
         self.llm = llm_provider
         self.memory = ConversationMemory(max_history=10)
         self.query_enhancer = QueryEnhancer()
         self.use_adaptive_config = use_adaptive_config
         
+        # Build BM25 sparse keyword index for hybrid search
+        self.bm25 = BM25Search()
+        self.bm25.build_index(chroma_db.collection)
+
         # Base retrieval_k (will be adjusted adaptively if enabled)
         base_retrieval_k = AdaptiveConfig.BASE_RETRIEVAL_K if use_adaptive_config else 5
-        self.retriever = HybridRetriever(chroma_db=chroma_db, retrieval_k=base_retrieval_k)
+        self.retriever = HybridRetriever(
+            chroma_db=chroma_db, retrieval_k=base_retrieval_k, bm25=self.bm25
+        )
         self.retrieval_k = base_retrieval_k
+
+        # Initialize reranker (cross-encoder for more precise relevance scoring)
+        self.use_reranker = use_reranker
+        if use_reranker:
+            self.reranker = Reranker(model_name="BAAI/bge-reranker-base", use_fp16=True)
+            if not self.reranker.is_available:
+                print("⚠️ Reranker failed to load — falling back to bi-encoder scoring only")
+                self.use_reranker = False
+        else:
+            self.reranker = None
 
         # Initialize metrics tracking
         self.session_metrics = []
@@ -41,6 +61,8 @@ class RAGChatbot:
         print(f"RAG Chatbot initialized with {self.db.collection.count()} documents")
         if use_adaptive_config:
             print("✅ Adaptive configuration enabled - parameters will adjust automatically")
+        if self.use_reranker:
+            print("✅ Reranker enabled — documents will be re-scored with cross-encoder")
 
     # ---- Session file management ----
 
@@ -127,12 +149,27 @@ class RAGChatbot:
 
     def retrieve_context(self, query: str, use_memory: bool = True) -> Tuple[List[Dict], str, Dict]:
         """Enhanced retrieval with query preprocessing"""
-        enhanced_query = self.query_enhancer.enhance_query(query)
-
-        # Skip retrieval for simple/non-informative queries
+        # Skip retrieval for simple/non-informative queries (before rewriting)
         if should_skip_retrieval(query):
+            enhanced_query = self.query_enhancer.enhance_query(query)
             print("⏭️ Skipping retrieval for simple query")
             return [], "", enhanced_query
+
+        # Fetch memory context BEFORE rewriting so the rewriter can resolve
+        # follow-up references (e.g. "那4年加起來是多少" -> "total 4-year tuition for BSAI")
+        memory_context = ""
+        if use_memory and len(self.memory.history) > 0:
+            # Use a small window for the rewriter prompt to keep it concise
+            memory_context = self.memory.format_for_context(n=3)
+
+        # LLM-based query rewriting (always runs: handles non-English, abbreviations, follow-ups)
+        rewritten = rewrite_query(self.llm, query, conversation_context=memory_context)
+        enhanced_query = self.query_enhancer.enhance_query(rewritten)
+        # Keep the original wording available for display
+        if rewritten != query:
+            enhanced_query['original_raw'] = query
+        # Store the rewritten query for downstream use (compressor, reranker)
+        enhanced_query['rewritten'] = rewritten
 
         # Get adaptive configuration
         if self.use_adaptive_config:
@@ -140,23 +177,25 @@ class RAGChatbot:
             adaptive_config = AdaptiveConfig.get_adaptive_config(
                 query=query,
                 enhanced_query=enhanced_query,
-                retrieved_docs=[],  # Will be updated after retrieval
+                retrieved_docs=[],
                 context="",
                 conversation_length=len(self.memory.history),
                 has_anaphora=has_anaphora
             )
-            # Update retriever's retrieval_k if needed
             if adaptive_config['retrieval_k'] != self.retriever.retrieval_k:
                 self.retriever.retrieval_k = adaptive_config['retrieval_k']
         else:
             adaptive_config = None
 
+        # Prepend full memory context to retrieval query
         if use_memory and len(self.memory.history) > 0:
             memory_history_n = adaptive_config['memory_history'] if adaptive_config else 2
-            memory_context = self.memory.format_for_context(n=memory_history_n)
-            enhanced_query['original'] = f"{memory_context}\nCurrent question: {enhanced_query['original']}"
+            full_memory = self.memory.format_for_context(n=memory_history_n)
+            enhanced_query['original'] = f"{full_memory}\nCurrent question: {enhanced_query['original']}"
 
-        retrieved_docs = self.retriever.hybrid_retrieval(enhanced_query, use_memory)
+        retrieved_docs = self.retriever.hybrid_retrieval(
+            enhanced_query, use_memory, reranker_mode=self.use_reranker
+        )
         
         # Adaptive filtering based on document quality
         if self.use_adaptive_config and retrieved_docs:
@@ -177,20 +216,40 @@ class RAGChatbot:
             is_deadline = is_deadline_query(query)
             threshold = 0.05 if is_deadline else 0.1
             k = self.retrieval_k * 2 if is_deadline else self.retrieval_k
-        
+
+        # Deduplicate retrieved documents before reranking (keep highest scoring copy)
+        if retrieved_docs:
+            seen = {}
+            for doc in retrieved_docs:
+                doc_id = doc['id']
+                if doc_id not in seen or doc.get('retrieval_score', 0) > seen[doc_id].get('retrieval_score', 0):
+                    seen[doc_id] = doc
+            retrieved_docs = list(seen.values())
+
+        # Rerank candidates with cross-encoder for more precise relevance scoring
+        RERANKER_TOP_K = 5  # Always keep the top 5 documents after reranking
+        if self.use_reranker and retrieved_docs:
+            # Use the raw query (without memory prepended) for reranking
+            retrieved_docs = self.reranker.rerank(query, retrieved_docs, top_k=RERANKER_TOP_K)
+            # After reranking, use a lower threshold since scores are normalized [0, 1]
+            threshold = max(threshold, 0.05)
+            k = RERANKER_TOP_K
+
         filtered_docs = [d for d in retrieved_docs if d.get('retrieval_score', 0) >= threshold]
         top_results = filtered_docs[:k]
 
+        # Context compression disabled -- was dropping relevant docs and hurting response quality
+        # compress_query = enhanced_query.get('rewritten', query)
+        # top_results = compress_context(self.llm, compress_query, top_results)
+
         context_parts = []
-        # Limit individual document length to prevent excessive context
-        max_doc_length = 2000  # characters per document
-        
+        max_doc_length = 2000
+
         for result in top_results:
             section = result['metadata'].get('section', 'Unknown Section')
             content = result['document']
             rank = result['rank']
             
-            # Truncate very long documents (keep first part which is usually most relevant)
             if len(content) > max_doc_length:
                 content = content[:max_doc_length] + "... [truncated]"
             

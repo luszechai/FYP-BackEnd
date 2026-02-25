@@ -46,7 +46,8 @@ def main():
         chatbot = RAGChatbot(
             chroma_db=db, 
             llm_provider=llm,
-            use_adaptive_config=Config.USE_ADAPTIVE_CONFIG
+            use_adaptive_config=Config.USE_ADAPTIVE_CONFIG,
+            use_reranker=Config.USE_RERANKER
         )
 
         print("✅ Setup complete!")

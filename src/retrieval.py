@@ -1,17 +1,21 @@
 """Retrieval strategies for document search"""
-from typing import List, Dict
+from typing import List, Dict, Optional
 from src.vector_db import ChromaDBManager
+from src.bm25_search import BM25Search, reciprocal_rank_fusion
 from src.utils import is_scholarship_query
 
 
 class HybridRetriever:
     """Handles hybrid retrieval strategies for document search"""
 
-    def __init__(self, chroma_db: ChromaDBManager, retrieval_k: int = 5):
+    def __init__(self, chroma_db: ChromaDBManager, retrieval_k: int = 5,
+                 bm25: Optional[BM25Search] = None):
         self.db = chroma_db
         self.retrieval_k = retrieval_k
+        self.bm25 = bm25
 
-    def hybrid_retrieval(self, enhanced_query: Dict, use_memory: bool = True) -> List[Dict]:
+    def hybrid_retrieval(self, enhanced_query: Dict, use_memory: bool = True,
+                         reranker_mode: bool = False) -> List[Dict]:
         """Perform hybrid retrieval with multiple query strategies"""
         all_results = {}
         
@@ -199,13 +203,41 @@ class HybridRetriever:
                     boost = min(0.15, role_matches * 0.05)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
+        # ── BM25 keyword search + Reciprocal Rank Fusion ──
+        if self.bm25 is not None and self.bm25.is_available:
+            bm25_k = base_n_results
+            raw_query = enhanced_query['original']
+            # Strip prepended memory context if present
+            if '\nCurrent question: ' in raw_query:
+                raw_query = raw_query.split('\nCurrent question: ')[-1]
+
+            print(f"🔍 Strategy BM25: Keyword search (k={bm25_k})")
+            bm25_results = self.bm25.search(raw_query, k=bm25_k)
+
+            # Build a vector ranking list (sorted by current retrieval_score)
+            vector_ranking = sorted(
+                all_results.values(),
+                key=lambda x: x.get('retrieval_score', 0),
+                reverse=True,
+            )
+
+            # Fuse vector + BM25 rankings with RRF
+            fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
+            all_results = {doc['id']: doc for doc in fused}
+        else:
+            # Assign retrieval_score for documents that may only have similarity
+            for doc in all_results.values():
+                doc.setdefault('retrieval_score', doc.get('similarity', 0))
+
         deduplicated = self._deduplicate_results(list(all_results.values()))
         sorted_results = sorted(deduplicated,
                               key=lambda x: x['retrieval_score'],
                               reverse=True)
 
-        # Return more results for scholarship queries
-        max_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
+        if reranker_mode:
+            max_results = self.retrieval_k * 4 if is_scholarship else self.retrieval_k * 3
+        else:
+            max_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
         return sorted_results[:max_results]
 
     def _deduplicate_results(self, results: List[Dict]) -> List[Dict]:

@@ -41,6 +41,10 @@ class Config:
     # Adaptive Configuration
     USE_ADAPTIVE_CONFIG: bool = True  # Enable automatic parameter adjustment
     
+    # Reranker Configuration
+    USE_RERANKER: bool = True  # Enable cross-encoder reranking (BAAI/bge-reranker-base)
+    RERANKER_MODEL: str = "BAAI/bge-reranker-base"
+    
     # Data Files
     DATA_FILE: str = "merged_rag_data.json"
     

@@ -2,8 +2,12 @@
 import os
 import csv
 import hashlib
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from abc import ABC, abstractmethod
+
+# text_cleaner disabled -- was stripping useful content during ingestion
+# from src.text_cleaner import remove_boilerplate, clean_text
 
 
 def _resolve_tesseract_path(path: str) -> str:
@@ -60,6 +64,20 @@ class DocumentLoader(ABC):
         """Generate a unique document ID based on file path"""
         return hashlib.md5(file_path.encode()).hexdigest()[:12]
 
+    @staticmethod
+    def get_file_dates(file_path: str) -> Dict[str, str]:
+        """Return file modification time and current ingestion timestamp as ISO strings."""
+        file_mtime = ""
+        try:
+            mtime = os.path.getmtime(file_path)
+            file_mtime = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            pass
+        return {
+            "file_modified_at": file_mtime,
+            "ingested_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+
 
 class PDFLoader(DocumentLoader):
     """
@@ -105,10 +123,13 @@ class PDFLoader(DocumentLoader):
         
         documents = []
         doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
         
         try:
             pdf_doc = fitz.open(file_path)
             total_pages = len(pdf_doc)
+            raw_texts = []
+            extraction_methods = []
             
             print(f"📄 Loading PDF: {os.path.basename(file_path)} ({total_pages} pages)")
             
@@ -117,13 +138,24 @@ class PDFLoader(DocumentLoader):
                 text = page.get_text().strip()
                 extraction_method = "text"
                 
-                # If text extraction yields little content, try OCR
                 if len(text) < self.min_text_length:
                     ocr_text = self._ocr_page(page)
                     if ocr_text and len(ocr_text) > len(text):
                         text = ocr_text
                         extraction_method = "ocr"
                 
+                raw_texts.append(text)
+                extraction_methods.append(extraction_method)
+            
+            pdf_doc.close()
+
+            # Remove repeated headers / footers across pages
+            cleaned_texts = remove_boilerplate(raw_texts)
+
+            for page_num, (text, method) in enumerate(
+                zip(cleaned_texts, extraction_methods)
+            ):
+                text = clean_text(text)
                 if text:
                     documents.append({
                         'content': text,
@@ -132,13 +164,12 @@ class PDFLoader(DocumentLoader):
                             'type': 'pdf',
                             'page': page_num + 1,
                             'total_pages': total_pages,
-                            'extraction_method': extraction_method,
-                            'parent_doc_id': doc_id
+                            'extraction_method': method,
+                            'parent_doc_id': doc_id,
+                            **date_meta,
                         }
                     })
-                    print(f"  📃 Page {page_num + 1}: {len(text)} chars ({extraction_method})")
-            
-            pdf_doc.close()
+                    print(f"  📃 Page {page_num + 1}: {len(text)} chars ({method})")
             
         except Exception as e:
             raise Exception(f"Error loading PDF {file_path}: {e}")
@@ -228,17 +259,16 @@ class ImageLoader(DocumentLoader):
             )
         
         doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
         
         print(f"🖼️ Loading image: {os.path.basename(file_path)}")
         
         try:
             img = Image.open(file_path)
             
-            # Convert to RGB if necessary (e.g., for RGBA images)
             if img.mode not in ('RGB', 'L'):
                 img = img.convert('RGB')
             
-            # Perform OCR
             text = pytesseract.image_to_string(img, lang=self.ocr_language)
             text = text.strip()
             
@@ -253,10 +283,11 @@ class ImageLoader(DocumentLoader):
                 'metadata': {
                     'source': file_path,
                     'type': 'image',
-                    'format': ext[1:],  # Remove the dot
+                    'format': ext[1:],
                     'extraction_method': 'ocr',
                     'parent_doc_id': doc_id,
-                    'image_size': f"{img.width}x{img.height}"
+                    'image_size': f"{img.width}x{img.height}",
+                    **date_meta,
                 }
             }]
             
@@ -273,19 +304,11 @@ class TextFileLoader(DocumentLoader):
     SUPPORTED_EXTENSIONS = {'.txt'}
     
     def load(self, file_path: str) -> List[Dict]:
-        """
-        Load a text file and return its content.
-        
-        Args:
-            file_path: Path to the text file
-            
-        Returns:
-            List with single document containing the file text and metadata
-        """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Text file not found: {file_path}")
         
         doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
         
         print(f"📝 Loading text file: {os.path.basename(file_path)}")
         
@@ -293,7 +316,6 @@ class TextFileLoader(DocumentLoader):
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read().strip()
         except UnicodeDecodeError:
-            # Fallback to latin-1 if utf-8 fails
             with open(file_path, 'r', encoding='latin-1') as f:
                 text = f.read().strip()
         
@@ -310,7 +332,8 @@ class TextFileLoader(DocumentLoader):
                 'type': 'text',
                 'format': 'txt',
                 'extraction_method': 'direct_read',
-                'parent_doc_id': doc_id
+                'parent_doc_id': doc_id,
+                **date_meta,
             }
         }]
 
@@ -324,19 +347,11 @@ class CSVLoader(DocumentLoader):
     SUPPORTED_EXTENSIONS = {'.csv'}
     
     def load(self, file_path: str) -> List[Dict]:
-        """
-        Load a CSV file and convert rows to readable text.
-        
-        Args:
-            file_path: Path to the CSV file
-            
-        Returns:
-            List with single document containing the CSV content as text
-        """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"CSV file not found: {file_path}")
         
         doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
         
         print(f"📊 Loading CSV file: {os.path.basename(file_path)}")
         
@@ -353,7 +368,6 @@ class CSVLoader(DocumentLoader):
                 row_count = 0
                 for row in reader:
                     if row:
-                        # Convert each row to "header: value" pairs
                         row_text = ", ".join(
                             f"{headers[i]}: {row[i]}" 
                             for i in range(min(len(headers), len(row)))
@@ -379,7 +393,8 @@ class CSVLoader(DocumentLoader):
                     'extraction_method': 'csv_reader',
                     'parent_doc_id': doc_id,
                     'row_count': row_count,
-                    'columns': headers
+                    'columns': headers,
+                    **date_meta,
                 }
             }]
             
@@ -403,19 +418,11 @@ class DocxLoader(DocumentLoader):
             )
     
     def load(self, file_path: str) -> List[Dict]:
-        """
-        Load a DOCX file and extract text from all paragraphs.
-        
-        Args:
-            file_path: Path to the DOCX file
-            
-        Returns:
-            List with single document containing the extracted text and metadata
-        """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"DOCX file not found: {file_path}")
         
         doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
         
         print(f"📄 Loading DOCX file: {os.path.basename(file_path)}")
         
@@ -428,7 +435,6 @@ class DocxLoader(DocumentLoader):
                 if text:
                     paragraphs.append(text)
             
-            # Also extract text from tables
             for table in doc.tables:
                 for row in table.rows:
                     row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
@@ -450,7 +456,8 @@ class DocxLoader(DocumentLoader):
                     'format': 'docx',
                     'extraction_method': 'python_docx',
                     'parent_doc_id': doc_id,
-                    'paragraph_count': len(paragraphs)
+                    'paragraph_count': len(paragraphs),
+                    **date_meta,
                 }
             }]
             
