@@ -29,8 +29,10 @@ Response Guidelines:
 - Maintain context from previous exchanges when relevant
 - Be friendly and professional
 - Keep responses concise but complete
-- DO NOT mention "Document X" or "Source: Document X" in your response - sources are automatically displayed separately
-- DO NOT list which documents you used - just provide the information naturally
+- When you use information from the provided documents, add inline citations using the document number in square brackets, e.g. [1], [2]. Use the document number shown in the [Document N] label. Place the citation immediately after the sentence or claim it supports. You may cite multiple sources like [1][3].
+- DO NOT create a references section at the end — the UI handles source display automatically
+- DO NOT mention "Document X" or "Source: Document X" in your prose — only use the [N] citation format
+- DO NOT list which documents you used - just provide the information naturally with inline [N] citations
 - The user may attach their own documents. When user-uploaded documents are provided, use them alongside the admission documents to answer questions."""
 
 

@@ -132,6 +132,65 @@ async def health():
     }
 
 
+def deduplicate_sources(raw_sources: list) -> list:
+    """Deduplicate sources by parent_doc_id or source_url to avoid showing multiple chunks from the same document."""
+    seen_sources = {}
+    sources = []
+
+    for source in raw_sources:
+        metadata = source.get('metadata', {})
+        section = metadata.get('section', 'Unknown Section')
+        source_file = metadata.get('source', '')
+        parent_doc_id = metadata.get('parent_doc_id', '')
+
+        source_url = (
+            metadata.get('url') or
+            metadata.get('link') or
+            metadata.get('source_url') or
+            (source_file if source_file and (source_file.startswith('http://') or source_file.startswith('https://')) else None)
+        )
+
+        if not source_url and source_file:
+            if source_file.startswith('/'):
+                base_url = Config.SOURCE_BASE_URL
+                source_url = base_url + source_file
+            elif 'www.' in source_file or '.edu' in source_file or '.hk' in source_file:
+                if not source_file.startswith('http'):
+                    source_url = 'https://' + source_file
+                else:
+                    source_url = source_file
+
+        unique_key = parent_doc_id if parent_doc_id else (source_url if source_url else source.get('id', ''))
+
+        if unique_key and unique_key not in seen_sources:
+            source_id = f"doc_{parent_doc_id}" if parent_doc_id else source.get('id', '')
+            source_name = f"Document {len(seen_sources) + 1} - {section}"
+
+            source_data = {
+                "id": source.get('id', ''),
+                "source_id": source_id,
+                "source_name": source_name,
+                "source_url": source_url if source_url else None,
+                "section": section,
+                "source_file": source_file,
+                "document": source.get('document', '')[:500] + "..." if len(source.get('document', '')) > 500 else source.get('document', ''),
+                "metadata": metadata,
+                "similarity": float(source.get('similarity', 0)),
+                "retrieval_score": float(source.get('retrieval_score', 0)),
+                "rank": len(seen_sources) + 1
+            }
+
+            seen_sources[unique_key] = source_data
+            sources.append(source_data)
+        elif unique_key in seen_sources:
+            existing = seen_sources[unique_key]
+            if source.get('retrieval_score', 0) > existing.get('retrieval_score', 0):
+                existing['similarity'] = float(source.get('similarity', 0))
+                existing['retrieval_score'] = float(source.get('retrieval_score', 0))
+
+    return sources
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Process a chat query"""
@@ -144,79 +203,13 @@ async def chat(request: ChatRequest):
     try:
         response = chatbot_instance.chat(request.query, use_memory=request.use_memory)
         
-        # Convert numpy types to native Python types for JSON serialization
         performance = {
             "total_time": float(response['performance']['total_time']),
             "retrieval_time": float(response['performance']['retrieval_time']),
             "generation_time": float(response['performance']['generation_time'])
         }
         
-        # Clean up sources for JSON serialization and add source links
-        # Deduplicate sources by parent_doc_id or source_url to avoid showing multiple chunks from same document
-        seen_sources = {}  # key: (parent_doc_id or source_url), value: source data
-        sources = []
-        
-        for source in response.get('sources', []):
-            metadata = source.get('metadata', {})
-            section = metadata.get('section', 'Unknown Section')
-            source_file = metadata.get('source', '')
-            parent_doc_id = metadata.get('parent_doc_id', '')
-            
-            # Extract source URL - the 'source' field in metadata contains the URL
-            # Check for URL in metadata (could be 'url', 'link', 'source_url', or 'source' field)
-            source_url = (
-                metadata.get('url') or 
-                metadata.get('link') or 
-                metadata.get('source_url') or
-                (source_file if source_file and (source_file.startswith('http://') or source_file.startswith('https://')) else None)
-            )
-            
-            # If no URL found, try to construct from source_file
-            if not source_url and source_file:
-                # If source_file looks like a URL path, construct full URL
-                if source_file.startswith('/'):
-                    # Use base URL from config
-                    base_url = Config.SOURCE_BASE_URL
-                    source_url = base_url + source_file
-                elif 'www.' in source_file or '.edu' in source_file or '.hk' in source_file:
-                    # Add https:// if missing
-                    if not source_file.startswith('http'):
-                        source_url = 'https://' + source_file
-                    else:
-                        source_url = source_file
-            
-            # Use parent_doc_id or source_url as unique key for deduplication
-            # Prefer parent_doc_id if available, otherwise use source_url
-            unique_key = parent_doc_id if parent_doc_id else (source_url if source_url else source.get('id', ''))
-            
-            # Only add if we haven't seen this source before
-            if unique_key and unique_key not in seen_sources:
-                # Generate source identifier
-                source_id = f"doc_{parent_doc_id}" if parent_doc_id else source.get('id', '')
-                source_name = f"Document {len(seen_sources) + 1} - {section}"
-                
-                source_data = {
-                    "id": source.get('id', ''),
-                    "source_id": source_id,
-                    "source_name": source_name,
-                    "source_url": source_url if source_url else None,  # External URL to original source (None if not available)
-                    "section": section,
-                    "source_file": source_file,
-                    "document": source.get('document', '')[:500] + "..." if len(source.get('document', '')) > 500 else source.get('document', ''),
-                    "metadata": metadata,
-                    "similarity": float(source.get('similarity', 0)),
-                    "retrieval_score": float(source.get('retrieval_score', 0)),
-                    "rank": len(seen_sources) + 1  # Re-rank after deduplication
-                }
-                
-                seen_sources[unique_key] = source_data
-                sources.append(source_data)
-            elif unique_key in seen_sources:
-                # Update similarity/score if this chunk has higher score
-                existing = seen_sources[unique_key]
-                if source.get('retrieval_score', 0) > existing.get('retrieval_score', 0):
-                    existing['similarity'] = float(source.get('similarity', 0))
-                    existing['retrieval_score'] = float(source.get('retrieval_score', 0))
+        sources = deduplicate_sources(response.get('sources', []))
         
         return ChatResponse(
             answer=response['answer'],
@@ -240,36 +233,41 @@ async def chat_stream(request: ChatRequest):
     
     async def generate():
         try:
-            # Retrieve context first
+            retrieval_start = time.time()
+
             retrieved_docs, context, enhanced_query = chatbot_instance.retrieve_context(
                 request.query, 
                 use_memory=request.use_memory
             )
+
+            retrieval_time = time.time() - retrieval_start
             
             if not context:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'No relevant information found'})}\n\n"
                 return
             
-            # Get conversation history for streaming
+            sources = deduplicate_sources(retrieved_docs)
+
+            yield f"data: {json.dumps({'type': 'metadata', 'sources': sources, 'enhanced_query': enhanced_query})}\n\n"
+            await asyncio.sleep(0)
+
             if request.use_memory and len(chatbot_instance.memory.history) > 0:
                 memory_n = 3
                 conversation_history = chatbot_instance.memory.get_recent_history(n=memory_n)
             else:
                 conversation_history = None
             
-            # Get system message
             from src.utils import get_current_datetime_info
             from src.prompts import build_system_message, build_user_prompt
             
             dt_info = get_current_datetime_info()
             
-            # Get user file context for prompt injection
             user_file_context = chatbot_instance.format_session_file_context() if chatbot_instance.session_files else None
 
             system_message = build_system_message(dt_info)
             user_prompt = build_user_prompt(request.query, context, dt_info, user_file_context=user_file_context)
             
-            # Stream response
+            generation_start = time.time()
             full_response = ""
             for chunk in chatbot_instance.llm.generate_response_stream(
                 prompt=user_prompt,
@@ -278,16 +276,22 @@ async def chat_stream(request: ChatRequest):
             ):
                 full_response += chunk
                 yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                await asyncio.sleep(0)
+
+            generation_time = time.time() - generation_start
             
-            # Update memory
             chatbot_instance.memory.add_exchange(
                 request.query,
                 full_response,
                 [doc['id'] for doc in retrieved_docs]
             )
             
-            # Send completion
-            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response})}\n\n"
+            performance = {
+                "total_time": round(retrieval_time + generation_time, 3),
+                "retrieval_time": round(retrieval_time, 3),
+                "generation_time": round(generation_time, 3),
+            }
+            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
