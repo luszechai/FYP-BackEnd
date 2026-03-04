@@ -21,8 +21,11 @@ from src.ragas_evaluation import (
     save_results,
     load_results,
 )
+from src.room_booking import RBSClient
+from src.rbs_intent import detect_rbs_intent, extract_rbs_params
 from config import Config
 import json
+import re
 import time
 import asyncio
 
@@ -39,6 +42,13 @@ app.add_middleware(
 
 # Global chatbot instance
 chatbot_instance: Optional[RAGChatbot] = None
+
+# Global RBS client (lives for the duration of the server process)
+rbs_client: Optional[RBSClient] = None
+
+# Tracks whether the most recent chat exchange was handled via the RBS path,
+# so follow-up queries like "how about march 5" stay in the RBS flow.
+_last_exchange_was_rbs: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -132,6 +142,92 @@ async def health():
     }
 
 
+# ---- RBS (Room Booking System) Endpoints ----
+
+class RBSLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/rbs/login")
+async def rbs_login(request: RBSLoginRequest):
+    """Authenticate with the Room Booking System."""
+    global rbs_client
+    try:
+        client = RBSClient()
+        success = client.login(request.username, request.password)
+        if success:
+            rbs_client = client
+            return {"success": True, "username": request.username}
+        return {"success": False, "message": "Invalid credentials or login failed."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/rbs/logout")
+async def rbs_logout():
+    """Logout from the Room Booking System."""
+    global rbs_client
+    if rbs_client:
+        rbs_client.logout()
+    rbs_client = None
+    return {"success": True}
+
+
+@app.get("/api/rbs/status")
+async def rbs_status():
+    """Check current RBS login status."""
+    if rbs_client and rbs_client.is_authenticated:
+        return {"logged_in": True, "username": rbs_client.username}
+    return {"logged_in": False, "username": None}
+
+
+@app.get("/api/rbs/debug")
+async def rbs_debug():
+    """Return diagnostic info about the RBS BookingDashboard as a dark-themed HTML page."""
+    from fastapi.responses import HTMLResponse
+    if rbs_client is None or not rbs_client.is_authenticated:
+        raise HTTPException(status_code=400, detail="Not logged in to RBS")
+    try:
+        data = rbs_client.get_dashboard_debug()
+        pretty = json.dumps(data, indent=2, ensure_ascii=False)
+        html = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<title>RBS Debug</title>"
+            "<style>"
+            "body{background:#1e1e2e;color:#cdd6f4;font-family:'Cascadia Code',Consolas,monospace;"
+            "margin:0;padding:24px;}"
+            "h1{color:#89b4fa;margin-bottom:4px;}"
+            "h2{color:#a6adc8;font-weight:normal;font-size:14px;margin-top:0;}"
+            "pre{background:#181825;border:1px solid #313244;border-radius:8px;"
+            "padding:16px;overflow-x:auto;font-size:13px;line-height:1.5;color:#a6e3a1;}"
+            ".key{color:#89b4fa;}.str{color:#a6e3a1;}.num{color:#fab387;}"
+            ".bool{color:#f38ba8;}.null{color:#6c7086;}"
+            "</style></head><body>"
+            f"<h1>RBS Debug Dashboard</h1>"
+            f"<h2>{len(data.get('rooms_found_by_get_rooms', []))} rooms found &middot; "
+            f"HTML {data.get('html_length', 0):,} bytes &middot; "
+            f"Page: {data.get('title', '')}</h2>"
+            f"<pre>{_syntax_highlight_json(pretty)}</pre>"
+            "</body></html>"
+        )
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _syntax_highlight_json(s: str) -> str:
+    """Minimal JSON syntax highlighter for the debug page."""
+    import html as _html
+    s = _html.escape(s)
+    s = re.sub(r'("(?:[^"\\]|\\.)*?")\s*:', r'<span class="key">\1</span>:', s)
+    s = re.sub(r':\s*("(?:[^"\\]|\\.)*?")', r': <span class="str">\1</span>', s)
+    s = re.sub(r':\s*(\d+\.?\d*)', r': <span class="num">\1</span>', s)
+    s = re.sub(r':\s*(true|false)', r': <span class="bool">\1</span>', s)
+    s = re.sub(r':\s*(null)', r': <span class="null">\1</span>', s)
+    return s
+
+
 def deduplicate_sources(raw_sources: list) -> list:
     """Deduplicate sources by parent_doc_id or source_url to avoid showing multiple chunks from the same document."""
     seen_sources = {}
@@ -222,6 +318,44 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
+def _build_rbs_context(params: dict, rooms_list: list, client: RBSClient) -> str:
+    """Dispatch to the correct RBSClient method based on extracted intent and format the result."""
+    intent = params.get("intent", "room_schedule")
+    room_name = params.get("room_name")
+    date = params.get("date")
+    time_start = params.get("time_start")
+    time_end = params.get("time_end")
+
+    def _resolve_room_id(name: str) -> str:
+        if not name:
+            return ""
+        for r in rooms_list:
+            if name.lower() in r["id"].lower() or name.lower() in r.get("name", "").lower():
+                return r["id"]
+        return name
+
+    if intent == "list_rooms":
+        return RBSClient.format_rooms_as_text(rooms_list)
+
+    if intent == "my_bookings":
+        bookings = client.get_my_bookings()
+        return RBSClient.format_my_bookings_as_text(bookings)
+
+    if intent == "search_all":
+        available = client.search_available_rooms(date or "", time_start, time_end)
+        return RBSClient.format_available_rooms_as_text(available, date or "", time_start or "", time_end or "")
+
+    if intent in ("room_schedule", "find_free"):
+        rid = _resolve_room_id(room_name)
+        if not rid:
+            return "Could not identify the room. Please specify a room name or number."
+        schedule = client.get_room_schedule(rid, date or "")
+        display_name = room_name or rid
+        return RBSClient.format_schedule_as_text(schedule, display_name, date or "")
+
+    return "Unsupported room booking request."
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
     """Process a chat query with streaming response"""
@@ -232,7 +366,62 @@ async def chat_stream(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
     
     async def generate():
+        global _last_exchange_was_rbs
         try:
+            from src.utils import get_current_datetime_info
+            from src.prompts import build_system_message, build_user_prompt, build_rbs_system_message, build_rbs_user_prompt
+
+            is_rbs = detect_rbs_intent(request.query, previous_was_rbs=_last_exchange_was_rbs)
+
+            # ---- RBS path ----
+            if is_rbs:
+                if rbs_client is None or not rbs_client.is_authenticated:
+                    _last_exchange_was_rbs = False
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Please log in to the Room Booking System first using the RBS button in the header.'})}\n\n"
+                    return
+
+                dt_info = get_current_datetime_info()
+                yield f"data: {json.dumps({'type': 'metadata', 'sources': [], 'enhanced_query': {'original': request.query, 'is_rbs': True}})}\n\n"
+                await asyncio.sleep(0)
+
+                rooms_list = rbs_client.get_rooms()
+                params = extract_rbs_params(chatbot_instance.llm, request.query, rooms_list, today=dt_info['date'])
+
+                rbs_context = _build_rbs_context(params, rooms_list, rbs_client)
+
+                system_message = build_rbs_system_message(dt_info)
+                user_prompt = build_rbs_user_prompt(request.query, rbs_context, dt_info)
+
+                conversation_history = None
+                if request.use_memory and len(chatbot_instance.memory.history) > 0:
+                    conversation_history = chatbot_instance.memory.get_recent_history(n=3)
+
+                generation_start = time.time()
+                full_response = ""
+                for chunk in chatbot_instance.llm.generate_response_stream(
+                    prompt=user_prompt,
+                    system_message=system_message,
+                    conversation_history=conversation_history,
+                ):
+                    full_response += chunk
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0)
+
+                generation_time = time.time() - generation_start
+
+                chatbot_instance.memory.add_exchange(request.query, full_response, [])
+                _last_exchange_was_rbs = True
+
+                performance = {
+                    "total_time": round(generation_time, 3),
+                    "retrieval_time": 0.0,
+                    "generation_time": round(generation_time, 3),
+                }
+                yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
+                return
+
+            # ---- Normal RAG path ----
+            _last_exchange_was_rbs = False
             retrieval_start = time.time()
 
             retrieved_docs, context, enhanced_query = chatbot_instance.retrieve_context(
@@ -256,9 +445,6 @@ async def chat_stream(request: ChatRequest):
                 conversation_history = chatbot_instance.memory.get_recent_history(n=memory_n)
             else:
                 conversation_history = None
-            
-            from src.utils import get_current_datetime_info
-            from src.prompts import build_system_message, build_user_prompt
             
             dt_info = get_current_datetime_info()
             
@@ -302,12 +488,14 @@ async def chat_stream(request: ChatRequest):
 @app.post("/api/clear")
 async def clear_memory():
     """Clear conversation memory and metrics"""
+    global _last_exchange_was_rbs
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
     
     chatbot_instance.memory.clear()
     chatbot_instance.session_metrics = []
     chatbot_instance.clear_session_files()
+    _last_exchange_was_rbs = False
     
     return {"message": "Memory, metrics, and session files cleared successfully"}
 
