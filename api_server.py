@@ -184,48 +184,21 @@ async def rbs_status():
 
 @app.get("/api/rbs/debug")
 async def rbs_debug():
-    """Return diagnostic info about the RBS BookingDashboard as a dark-themed HTML page."""
-    from fastapi.responses import HTMLResponse
+    """Return discovered rooms and their scheduler IDs as JSON."""
     if rbs_client is None or not rbs_client.is_authenticated:
         raise HTTPException(status_code=400, detail="Not logged in to RBS")
     try:
-        data = rbs_client.get_dashboard_debug()
-        pretty = json.dumps(data, indent=2, ensure_ascii=False)
-        html = (
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<title>RBS Debug</title>"
-            "<style>"
-            "body{background:#1e1e2e;color:#cdd6f4;font-family:'Cascadia Code',Consolas,monospace;"
-            "margin:0;padding:24px;}"
-            "h1{color:#89b4fa;margin-bottom:4px;}"
-            "h2{color:#a6adc8;font-weight:normal;font-size:14px;margin-top:0;}"
-            "pre{background:#181825;border:1px solid #313244;border-radius:8px;"
-            "padding:16px;overflow-x:auto;font-size:13px;line-height:1.5;color:#a6e3a1;}"
-            ".key{color:#89b4fa;}.str{color:#a6e3a1;}.num{color:#fab387;}"
-            ".bool{color:#f38ba8;}.null{color:#6c7086;}"
-            "</style></head><body>"
-            f"<h1>RBS Debug Dashboard</h1>"
-            f"<h2>{len(data.get('rooms_found_by_get_rooms', []))} rooms found &middot; "
-            f"HTML {data.get('html_length', 0):,} bytes &middot; "
-            f"Page: {data.get('title', '')}</h2>"
-            f"<pre>{_syntax_highlight_json(pretty)}</pre>"
-            "</body></html>"
-        )
-        return HTMLResponse(content=html)
+        rooms = rbs_client.get_rooms(force_refresh=True)
+        return {
+            "rooms_count": len(rooms),
+            "rooms": [
+                {"id": r["id"], "scheduler_id": r.get("scheduler_id", ""), "name": r["name"], "type": r.get("type", "")}
+                for r in rooms
+            ],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-def _syntax_highlight_json(s: str) -> str:
-    """Minimal JSON syntax highlighter for the debug page."""
-    import html as _html
-    s = _html.escape(s)
-    s = re.sub(r'("(?:[^"\\]|\\.)*?")\s*:', r'<span class="key">\1</span>:', s)
-    s = re.sub(r':\s*("(?:[^"\\]|\\.)*?")', r': <span class="str">\1</span>', s)
-    s = re.sub(r':\s*(\d+\.?\d*)', r': <span class="num">\1</span>', s)
-    s = re.sub(r':\s*(true|false)', r': <span class="bool">\1</span>', s)
-    s = re.sub(r':\s*(null)', r': <span class="null">\1</span>', s)
-    return s
 
 
 def deduplicate_sources(raw_sources: list) -> list:
@@ -326,13 +299,22 @@ def _build_rbs_context(params: dict, rooms_list: list, client: RBSClient) -> str
     time_start = params.get("time_start")
     time_end = params.get("time_end")
 
-    def _resolve_room_id(name: str) -> str:
+    print(f"[RBS] intent={intent} | room={room_name} | date={date} | time={time_start}-{time_end}")
+
+    def _resolve_room(name: str) -> Optional[Dict]:
+        """Find the room dict matching the user's room reference."""
         if not name:
-            return ""
+            return None
+        name_lower = name.lower()
         for r in rooms_list:
-            if name.lower() in r["id"].lower() or name.lower() in r.get("name", "").lower():
-                return r["id"]
-        return name
+            if name_lower == r["id"].lower():
+                return r
+            if name_lower in r.get("name", "").lower():
+                return r
+        for r in rooms_list:
+            if name_lower in r["id"].lower():
+                return r
+        return None
 
     if intent == "list_rooms":
         return RBSClient.format_rooms_as_text(rooms_list)
@@ -346,11 +328,14 @@ def _build_rbs_context(params: dict, rooms_list: list, client: RBSClient) -> str
         return RBSClient.format_available_rooms_as_text(available, date or "", time_start or "", time_end or "")
 
     if intent in ("room_schedule", "find_free"):
-        rid = _resolve_room_id(room_name)
-        if not rid:
+        room = _resolve_room(room_name)
+        if not room:
             return "Could not identify the room. Please specify a room name or number."
-        schedule = client.get_room_schedule(rid, date or "")
-        display_name = room_name or rid
+        scheduler_id = room.get("scheduler_id")
+        if not scheduler_id:
+            return f"Room {room['id']} was found but has no scheduler ID. Cannot fetch schedule."
+        schedule = client.get_room_schedule(scheduler_id, date or "")
+        display_name = room_name or room["id"]
         return RBSClient.format_schedule_as_text(schedule, display_name, date or "")
 
     return "Unsupported room booking request."
@@ -430,10 +415,7 @@ async def chat_stream(request: ChatRequest):
             )
 
             retrieval_time = time.time() - retrieval_start
-            
-            if not context:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'No relevant information found'})}\n\n"
-                return
+
             
             sources = deduplicate_sources(retrieved_docs)
 
