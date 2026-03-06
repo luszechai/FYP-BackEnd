@@ -368,12 +368,15 @@ async def chat_stream(request: ChatRequest):
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Please log in to the Room Booking System first using the RBS button in the header.'})}\n\n"
                     return
 
-                dt_info = get_current_datetime_info()
-                yield f"data: {json.dumps({'type': 'metadata', 'sources': [], 'enhanced_query': {'original': request.query, 'is_rbs': True}})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Checking room booking system...'})}\n\n"
                 await asyncio.sleep(0)
 
+                dt_info = get_current_datetime_info()
                 rooms_list = rbs_client.get_rooms()
                 params = extract_rbs_params(chatbot_instance.llm, request.query, rooms_list, today=dt_info['date'])
+
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Fetching room schedules...'})}\n\n"
+                await asyncio.sleep(0)
 
                 rbs_context = _build_rbs_context(params, rooms_list, rbs_client)
 
@@ -383,6 +386,10 @@ async def chat_stream(request: ChatRequest):
                 conversation_history = None
                 if request.use_memory and len(chatbot_instance.memory.history) > 0:
                     conversation_history = chatbot_instance.memory.get_recent_history(n=3)
+
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Generating response...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'metadata', 'sources': [], 'enhanced_query': {'original': request.query, 'is_rbs': True}})}\n\n"
+                await asyncio.sleep(0)
 
                 generation_start = time.time()
                 full_response = ""
@@ -410,6 +417,10 @@ async def chat_stream(request: ChatRequest):
 
             # ---- Normal RAG path ----
             _last_exchange_was_rbs = False
+
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Searching knowledge base...'})}\n\n"
+            await asyncio.sleep(0)
+
             retrieval_start = time.time()
 
             retrieved_docs, context, enhanced_query = chatbot_instance.retrieve_context(
@@ -422,6 +433,7 @@ async def chat_stream(request: ChatRequest):
             
             sources = deduplicate_sources(retrieved_docs)
 
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Generating response...'})}\n\n"
             yield f"data: {json.dumps({'type': 'metadata', 'sources': sources, 'enhanced_query': enhanced_query})}\n\n"
             await asyncio.sleep(0)
 

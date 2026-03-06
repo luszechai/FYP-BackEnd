@@ -18,8 +18,8 @@ class Config:
     DEEPSEEK_MODEL: str = "deepseek-chat"
     
     # LLM Settings
-    LLM_TEMPERATURE: float = 0.7
-    LLM_MAX_TOKENS: int = 8192
+    LLM_TEMPERATURE: float = 0.3
+    LLM_MAX_TOKENS: int = 1024
     LLM_ENABLE_CACHE: bool = True  # Enable response caching
     LLM_ENABLE_STREAMING: bool = False  # Enable streaming (set to True for better UX)
     
