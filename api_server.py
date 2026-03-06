@@ -333,8 +333,11 @@ def _build_rbs_context(params: dict, rooms_list: list, client: RBSClient) -> str
             return "Could not identify the room. Please specify a room name or number."
         scheduler_id = room.get("scheduler_id")
         if not scheduler_id:
-            return f"Room {room['id']} was found but has no scheduler ID. Cannot fetch schedule."
-        schedule = client.get_room_schedule(scheduler_id, date or "")
+            return (
+                f"Room {room['id']} was found but has no scheduler ID in the system. "
+                "Cannot fetch its schedule — availability CANNOT be confirmed."
+            )
+        schedule = client.get_room_schedule(scheduler_id, date or "", room_code=room["id"])
         display_name = room_name or room["id"]
         return RBSClient.format_schedule_as_text(schedule, display_name, date or "")
 

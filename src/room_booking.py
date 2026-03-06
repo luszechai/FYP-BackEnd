@@ -92,7 +92,7 @@ class RBSClient:
     # ------------------------------------------------------------------
 
     _CARD_TITLE_RE = re.compile(
-        r'^(.+?)\s*-\s*(.+)\(([A-Za-z]?\d{3,4}[A-Za-z]?)\)\s*$'
+        r'^(.+?)\s*-\s*(.+)\(([A-Za-z]{0,3}\d{1,4}(?:-\d{1,4})?[A-Za-z]?)\)\s*$'
     )
     _SCHEDULER_LINK_RE = re.compile(r'/Scheduler/Index/(\d+)')
 
@@ -175,17 +175,35 @@ class RBSClient:
                 "type": room_type,
             })
 
-        if rooms:
-            with_sid = sum(1 for r in rooms if r["scheduler_id"])
-            print(f"[RBS] Parsed {len(rooms)} room cards ({with_sid} with scheduler IDs)")
-        return rooms
+        # Filter out phantom entries: rooms parsed from page text that have
+        # no corresponding /Scheduler/Index/ link are unlikely to be real
+        # bookable rooms (e.g. old references still on the page).
+        valid_rooms = []
+        for r in rooms:
+            if r["scheduler_id"]:
+                valid_rooms.append(r)
+            else:
+                print(f"[RBS] Dropping room {r['id']} ({r['name']}) — no scheduler ID found")
+
+        if valid_rooms:
+            print(f"[RBS] Parsed {len(valid_rooms)} rooms with scheduler IDs "
+                  f"(dropped {len(rooms) - len(valid_rooms)} without)")
+        return valid_rooms
+
+    _ROOM_CODE_IN_PARENS_RE = re.compile(r'\(([A-Za-z]{0,3}\d{1,4}(?:-\d{1,4})?[A-Za-z]?)\)')
 
     def _find_scheduler_ids(self, soup: BeautifulSoup) -> Dict[str, str]:
         """Scan the page for /Scheduler/Index/{id} links and map room codes
         to their internal scheduler IDs.
 
-        Walks up the DOM from each matching link to find a nearby room number
-        pattern like (302), then records room_code -> scheduler_id.
+        Walks up the DOM from each matching link. At each level, counts the
+        unique room codes visible in the parent text:
+        - Exactly 1 code  → safe to map, stop.
+        - Multiple codes   → walked into a shared container, stop WITHOUT mapping.
+        - Zero codes       → keep walking up.
+
+        Uses ``setdefault`` so the first (shallowest) mapping for a room code
+        is never overwritten by a deeper, less-reliable walk from another link.
         """
         mapping: Dict[str, str] = {}
 
@@ -196,18 +214,22 @@ class RBSClient:
             scheduler_id = m.group(1)
 
             parent = link.parent
-            for _ in range(6):
+            for _ in range(10):
                 if parent is None:
                     break
                 search_text = parent.get_text(separator=" ", strip=True)
-                room_match = re.search(r'\(([A-Za-z]?\d{3,4}[A-Za-z]?)\)', search_text)
-                if room_match:
-                    mapping[room_match.group(1)] = scheduler_id
+                codes_found = self._ROOM_CODE_IN_PARENS_RE.findall(search_text)
+                unique_codes = list(dict.fromkeys(codes_found))
+
+                if len(unique_codes) == 1:
+                    mapping.setdefault(unique_codes[0], scheduler_id)
+                    break
+                elif len(unique_codes) > 1:
                     break
                 parent = parent.parent
 
         if mapping:
-            print(f"[RBS] Scheduler ID mapping: {mapping}")
+            print(f"[RBS] Scheduler ID mapping ({len(mapping)} rooms): {mapping}")
         return mapping
 
     # ------------------------------------------------------------------
@@ -227,18 +249,25 @@ class RBSClient:
         scheduler_id: str,
         date_from: str,
         date_to: Optional[str] = None,
-    ) -> List[Dict]:
+        room_code: str = "",
+    ) -> Optional[List[Dict]]:
         """Fetch booked events for a room via the Scheduler page session.
 
         1. Navigates to /Scheduler/Index/{scheduler_id} to set the session.
         2. Calls /api/recurringEvents with the appropriate week range.
 
+        Returns a list of events on success, or ``None`` if the navigation
+        or fetch failed (so callers can distinguish "no bookings" from
+        "could not retrieve data").
+
         Args:
             scheduler_id: Internal room ID (from room["scheduler_id"]).
             date_from: Start date (YYYY-MM-DD).
             date_to:   End date (defaults to end of the week containing date_from).
+            room_code: Display room code for logging (e.g. "302").
         """
-        self._navigate_to_room(scheduler_id)
+        if not self._navigate_to_room(scheduler_id, room_code):
+            return None
 
         if date_to is None:
             week_from, week_to = self.get_week_range(date_from)
@@ -249,18 +278,27 @@ class RBSClient:
 
         return self._fetch_recurring_events(week_from, week_to)
 
-    def _navigate_to_room(self, scheduler_id: str) -> None:
-        """Visit the Scheduler page for a room to set the session context."""
+    def _navigate_to_room(self, scheduler_id: str, room_code: str = "") -> bool:
+        """Visit the Scheduler page for a room to set the session context.
+
+        Returns True on success, False on failure.
+        """
+        label = f"{room_code} (sid={scheduler_id})" if room_code else f"sid={scheduler_id}"
         url = f"{self.BASE_URL}/Scheduler/Index/{scheduler_id}"
         try:
             resp = self.session.get(url, timeout=15)
             resp.raise_for_status()
-            print(f"[RBS] Navigated to Scheduler page for room {scheduler_id}")
+            print(f"[RBS] Navigated to room {label}")
+            return True
         except Exception as e:
-            print(f"[RBS] Warning: could not navigate to Scheduler page: {e}")
+            print(f"[RBS] Failed to navigate to room {label}: {e}")
+            return False
 
-    def _fetch_recurring_events(self, date_from: str, date_to: str) -> List[Dict]:
-        """Call the recurringEvents API (session determines the room)."""
+    def _fetch_recurring_events(self, date_from: str, date_to: str) -> Optional[List[Dict]]:
+        """Call the recurringEvents API (session determines the room).
+
+        Returns a list of events on success, or ``None`` on failure.
+        """
         url = f"{self.BASE_URL}/api/recurringEvents"
         params = {"timeshift": "-480", "from": date_from, "to": date_to}
         try:
@@ -269,7 +307,7 @@ class RBSClient:
             raw = resp.json()
         except Exception as e:
             print(f"[RBS] Error fetching recurring events: {e}")
-            return []
+            return None
 
         items = raw if isinstance(raw, list) else raw.get("data", raw.get("events", []))
         return [self._normalize_event(item) for item in items]
@@ -358,7 +396,10 @@ class RBSClient:
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
     ) -> List[Dict]:
-        """Return rooms that are free during the given window."""
+        """Return rooms that are free during the given window.
+
+        Rooms whose schedule could not be fetched are skipped (not assumed free).
+        """
         rooms = self.get_rooms()
         available = []
 
@@ -366,7 +407,9 @@ class RBSClient:
             sid = room.get("scheduler_id")
             if not sid:
                 continue
-            schedule = self.get_room_schedule(sid, date)
+            schedule = self.get_room_schedule(sid, date, room_code=room.get("id", ""))
+            if schedule is None:
+                continue
             if self._is_free(schedule, date, time_start, time_end):
                 available.append({**room, "schedule": schedule})
 
@@ -435,8 +478,19 @@ class RBSClient:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def format_schedule_as_text(schedule: List[Dict], room_name: str = "", date: str = "") -> str:
-        """Convert schedule data into clean text for LLM context, grouped by date."""
+    def format_schedule_as_text(schedule: Optional[List[Dict]], room_name: str = "", date: str = "") -> str:
+        """Convert schedule data into clean text for LLM context, grouped by date.
+
+        ``None`` means the fetch failed — availability is unknown.
+        An empty list ``[]`` means the fetch succeeded with zero bookings.
+        """
+        if schedule is None:
+            header = f"Room {room_name}" if room_name else "Room"
+            return (
+                f"{header}: ERROR — Could not retrieve schedule data from the booking system. "
+                "Availability CANNOT be confirmed. Do NOT assume the room is free."
+            )
+
         if not schedule:
             header = f"Room {room_name}" if room_name else "Room"
             if date:

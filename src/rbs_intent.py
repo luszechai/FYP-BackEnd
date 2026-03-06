@@ -7,11 +7,12 @@ from typing import Dict, List, Optional
 _RBS_KEYWORDS = [
     "room", "booking", "book", "booked", "available", "schedule",
     "rbs", "vacancy", "vacant", "occupied", "free room",
-    "reserve", "reservation",
+    "reserve", "reservation", "study pod", "discussion room",
 ]
 
 _ROOM_PATTERN = re.compile(
-    r"\b(?:room\s*)?(\d{3,4}[A-Za-z]?)\b", re.IGNORECASE
+    r"\b(?:room\s*)?([A-Za-z]{1,3}\d{1,4}(?:-\d{1,4})?|\d{3,4}(?:-\d{1,4})?[A-Za-z]?)\b",
+    re.IGNORECASE,
 )
 
 _TIME_SLOT_WORDS = {"period", "slot", "session", "time slot", "block"}

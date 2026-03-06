@@ -137,7 +137,8 @@ GUIDELINES:
 - If the user's request violates any booking rule above, politely explain which rule applies.
 - If a requested time slot has already passed today, note it briefly.
 - Be concise and well-structured — use bullet points or tables for schedules.
-- Be friendly and professional."""
+- Be friendly and professional.
+- CRITICAL: If the data indicates that schedule information could NOT be retrieved (e.g. "ERROR", "Could not retrieve", "CANNOT be confirmed"), you MUST tell the user that the schedule is unavailable and you cannot confirm availability. NEVER assume a room is free when the data could not be fetched."""
 
 
 def build_rbs_user_prompt(query: str, rbs_context: str, dt_info: Dict[str, str]) -> str:
