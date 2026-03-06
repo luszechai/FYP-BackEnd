@@ -418,7 +418,7 @@ async def chat_stream(request: ChatRequest):
             # ---- Normal RAG path ----
             _last_exchange_was_rbs = False
 
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Searching knowledge base...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Thinking...'})}\n\n"
             await asyncio.sleep(0)
 
             retrieval_start = time.time()
