@@ -255,6 +255,11 @@ class ChromaDBManager:
                     'ingested_at': doc_metadata.get('ingested_at',
                                                      datetime.now(tz=timezone.utc).isoformat()),
                 }
+
+                if doc_metadata.get('url'):
+                    chunk_metadata['url'] = doc_metadata['url']
+                if doc_metadata.get('section'):
+                    chunk_metadata['section'] = doc_metadata['section']
                 
                 # Add page info for PDFs
                 if 'page' in doc_metadata:

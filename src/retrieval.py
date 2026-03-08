@@ -4,6 +4,9 @@ from src.vector_db import ChromaDBManager
 from src.bm25_search import BM25Search, reciprocal_rank_fusion
 from src.utils import is_scholarship_query
 
+# Use only BM25 for retrieval; all other strategies (vector, expanded queries, keyword boosting) are disabled.
+BM25_ONLY = True
+
 
 class HybridRetriever:
     """Handles hybrid retrieval strategies for document search"""
@@ -26,22 +29,23 @@ class HybridRetriever:
         # Adjust retrieval size for scholarship queries
         base_n_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
 
-        print(f"🔍 Strategy 1: Original query (k={base_n_results})")
-        results = self.db.query(query_text=enhanced_query['original'], n_results=base_n_results)
-        for doc in self.db.format_results(results):
-            doc_id = doc['id']
-            if doc_id not in all_results:
-                all_results[doc_id] = doc
-                all_results[doc_id]['retrieval_score'] = doc['similarity']
-            else:
-                all_results[doc_id]['retrieval_score'] = max(
-                    all_results[doc_id]['retrieval_score'],
-                    doc['similarity']
-                )
+        if not BM25_ONLY:
+            print(f"🔍 Strategy 1: Original query (k={base_n_results})")
+            results = self.db.query(query_text=enhanced_query['original'], n_results=base_n_results)
+            for doc in self.db.format_results(results):
+                doc_id = doc['id']
+                if doc_id not in all_results:
+                    all_results[doc_id] = doc
+                    all_results[doc_id]['retrieval_score'] = doc['similarity']
+                else:
+                    all_results[doc_id]['retrieval_score'] = max(
+                        all_results[doc_id]['retrieval_score'],
+                        doc['similarity']
+                    )
         
         # Strategy 1.6: Scholarship-specific queries (enhanced for listing queries)
         is_scholarship_enhanced = is_scholarship or enhanced_query.get('is_scholarship_query', False)
-        if is_scholarship_enhanced:
+        if not BM25_ONLY and is_scholarship_enhanced:
             print(f"🔍 Strategy 1.6: Scholarship queries (listing + deadline)")
             
             # Check if this is a listing query (asking for available scholarships)
@@ -99,7 +103,7 @@ class HybridRetriever:
                     boost = min(0.15, keyword_matches * 0.04)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
-        if enhanced_query['is_person_query'] and len(enhanced_query['expanded_queries']) > 1:
+        if not BM25_ONLY and enhanced_query['is_person_query'] and len(enhanced_query['expanded_queries']) > 1:
             print(f"🔍 Strategy 2: Expanded person queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:3]:
@@ -116,7 +120,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.3: Expanded Role Queries (for queries like "who is the programme leader of AI")
-        if enhanced_query.get('is_role_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if not BM25_ONLY and enhanced_query.get('is_role_query', False) and len(enhanced_query['expanded_queries']) > 1:
             print(f"🔍 Strategy 2.3: Expanded role queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:5]:
@@ -133,7 +137,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.5: Expanded Program Queries
-        if enhanced_query.get('is_program_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if not BM25_ONLY and enhanced_query.get('is_program_query', False) and len(enhanced_query['expanded_queries']) > 1:
             print(f"🔍 Strategy 2.5: Expanded Program queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:4]:
@@ -150,7 +154,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.6: Expanded Scholarship Queries
-        if enhanced_query.get('is_scholarship_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if not BM25_ONLY and enhanced_query.get('is_scholarship_query', False) and len(enhanced_query['expanded_queries']) > 1:
             print(f"🔍 Strategy 2.6: Expanded Scholarship queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:6]:
@@ -167,7 +171,7 @@ class HybridRetriever:
                         )
 
         # Strategy 3: Keyword matching with context boosting
-        if enhanced_query['keywords']:
+        if not BM25_ONLY and enhanced_query['keywords']:
             print(f"🔍 Strategy 3: Keyword matching")
             for doc_id, doc in all_results.items():
                 content_lower = doc['document'].lower()
@@ -191,7 +195,7 @@ class HybridRetriever:
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
         # Strategy 3.5: Role-specific keyword boosting
-        if enhanced_query.get('is_role_query', False):
+        if not BM25_ONLY and enhanced_query.get('is_role_query', False):
             print(f"🔍 Strategy 3.5: Role-specific keyword boosting")
             role_keywords = ['programme leader', 'program leader', 'director', 'head of', 
                            'role', 'coordinator', 'dean', 'chair']
@@ -203,7 +207,7 @@ class HybridRetriever:
                     boost = min(0.15, role_matches * 0.05)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
-        # ── BM25 keyword search + Reciprocal Rank Fusion ──
+        # ── BM25 keyword search (+ optional RRF fusion with vector when not BM25_ONLY) ──
         if self.bm25 is not None and self.bm25.is_available:
             bm25_k = base_n_results
             raw_query = enhanced_query['original']
@@ -214,20 +218,29 @@ class HybridRetriever:
             print(f"🔍 Strategy BM25: Keyword search (k={bm25_k})")
             bm25_results = self.bm25.search(raw_query, k=bm25_k)
 
-            # Build a vector ranking list (sorted by current retrieval_score)
-            vector_ranking = sorted(
-                all_results.values(),
-                key=lambda x: x.get('retrieval_score', 0),
-                reverse=True,
-            )
-
-            # Fuse vector + BM25 rankings with RRF
-            fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
-            all_results = {doc['id']: doc for doc in fused}
+            if BM25_ONLY:
+                # Use only BM25 ranking; no fusion with vector or other strategies
+                for doc in bm25_results:
+                    doc['retrieval_score'] = doc.get('bm25_score', 1.0 / (doc.get('rank', 1) + 1))
+                all_results = {doc['id']: doc for doc in bm25_results}
+            else:
+                # Build a vector ranking list (sorted by current retrieval_score)
+                vector_ranking = sorted(
+                    all_results.values(),
+                    key=lambda x: x.get('retrieval_score', 0),
+                    reverse=True,
+                )
+                # Fuse vector + BM25 rankings with RRF
+                fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
+                all_results = {doc['id']: doc for doc in fused}
         else:
-            # Assign retrieval_score for documents that may only have similarity
-            for doc in all_results.values():
-                doc.setdefault('retrieval_score', doc.get('similarity', 0))
+            if BM25_ONLY:
+                # BM25-only mode but BM25 not available; keep all_results empty (no fallback)
+                pass
+            else:
+                # Assign retrieval_score for documents that may only have similarity
+                for doc in all_results.values():
+                    doc.setdefault('retrieval_score', doc.get('similarity', 0))
 
         deduplicated = self._deduplicate_results(list(all_results.values()))
         sorted_results = sorted(deduplicated,

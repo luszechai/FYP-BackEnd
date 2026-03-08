@@ -8,24 +8,40 @@ import json
 class LLMProvider:
     """Manages LLM API interactions with performance tracking and caching"""
 
+    PROVIDER_DEFAULTS = {
+        "deepseek": {
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-chat",
+        },
+        "kimi": {
+            "base_url": "https://api.moonshot.cn/v1",
+            "model": "moonshot-v1-8k",
+        },
+    }
+
     def __init__(self, provider: str = "deepseek", api_key: str = None, temperature: float = 0.5, 
-                 max_tokens: int = 10000, enable_cache: bool = True):
+                 max_tokens: int = 10000, enable_cache: bool = True,
+                 base_url: str = None, model: str = None):
         self.provider = provider.lower()
-        self.temperature = temperature  # Lower temperature (0.5) for faster, more deterministic responses
-        self.max_tokens = max_tokens  # Allow longer responses
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.api_key = api_key
-        self.base_url = "https://api.deepseek.com"
+        defaults = self.PROVIDER_DEFAULTS.get(self.provider, {})
+        self.base_url = base_url or defaults.get("base_url", "https://api.deepseek.com")
+        self.model_name = model or defaults.get("model", "deepseek-chat")
         self.client = None
         self.enable_cache = enable_cache
-        self._cache = {}  # Simple in-memory cache
+        self._cache = {}
         self._initialize_provider()
 
     def _initialize_provider(self):
         """Initialize the LLM provider client"""
-        if self.provider == "deepseek":
+        if self.provider in ("deepseek", "kimi"):
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-            self.model_name = "deepseek-chat"
-            print(f"Initialized DeepSeek: {self.model_name}")
+            label = "DeepSeek" if self.provider == "deepseek" else "Kimi"
+            print(f"Initialized {label}: {self.model_name} @ {self.base_url}")
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}")
 
     def _get_cache_key(self, messages: List[Dict]) -> str:
         """Generate cache key from messages"""

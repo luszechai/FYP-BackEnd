@@ -226,6 +226,13 @@ class RAGChatbot:
                     seen[doc_id] = doc
             retrieved_docs = list(seen.values())
 
+        # Drop irrelevant chunks (and compress) before reranking.
+        # Use the original user query when available so relevance is judged against
+        # what the user actually asked (e.g. "where can I find Wallace" vs rewritten
+        # "Wallace Hall location"), avoiding incorrect drops of person/location chunks.
+        compress_query = enhanced_query.get('original_raw', enhanced_query.get('rewritten', query))
+        retrieved_docs = compress_context(self.llm, compress_query, retrieved_docs, max_documents=15)
+
         # Rerank candidates with cross-encoder for more precise relevance scoring
         RERANKER_TOP_K = 5  # Always keep the top 5 documents after reranking
         if self.use_reranker and retrieved_docs:
@@ -237,10 +244,6 @@ class RAGChatbot:
 
         filtered_docs = [d for d in retrieved_docs if d.get('retrieval_score', 0) >= threshold]
         top_results = filtered_docs[:k]
-
-        # Context compression disabled -- was dropping relevant docs and hurting response quality
-        # compress_query = enhanced_query.get('rewritten', query)
-        # top_results = compress_context(self.llm, compress_query, top_results)
 
         context_parts = []
         max_doc_length = 2000

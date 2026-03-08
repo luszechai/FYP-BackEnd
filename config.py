@@ -16,6 +16,11 @@ class Config:
     DEEPSEEK_API_KEY: Optional[str] = os.getenv("DEEPSEEK_API_KEY")
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_MODEL: str = "deepseek-chat"
+
+    # Kimi AI (Moonshot) Configuration
+    KIMI_API_KEY: Optional[str] = os.getenv("KIMI_API_KEY")
+    KIMI_BASE_URL: str = "https://api.moonshot.cn/v1"
+    KIMI_MODEL: str = "moonshot-v1-8k"
     
     # LLM Settings
     LLM_TEMPERATURE: float = 0.3

@@ -43,6 +43,9 @@ app.add_middleware(
 # Global chatbot instance
 chatbot_instance: Optional[RAGChatbot] = None
 
+# LLM providers keyed by name (populated at startup)
+llm_providers: Dict[str, LLMProvider] = {}
+
 # Global RBS client (lives for the duration of the server process)
 rbs_client: Optional[RBSClient] = None
 
@@ -54,6 +57,7 @@ _last_exchange_was_rbs: bool = False
 class ChatRequest(BaseModel):
     query: str
     use_memory: bool = True
+    provider: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -80,7 +84,7 @@ class HistoryResponse(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """Initialize chatbot on startup"""
-    global chatbot_instance
+    global chatbot_instance, llm_providers
     
     try:
         Config.validate()
@@ -94,6 +98,21 @@ async def startup_event():
             max_tokens=Config.LLM_MAX_TOKENS,
             enable_cache=Config.LLM_ENABLE_CACHE
         )
+        llm_providers["deepseek"] = llm
+        
+        if Config.KIMI_API_KEY:
+            kimi_llm = LLMProvider(
+                provider="kimi",
+                api_key=Config.KIMI_API_KEY,
+                temperature=Config.LLM_TEMPERATURE,
+                max_tokens=Config.LLM_MAX_TOKENS,
+                enable_cache=Config.LLM_ENABLE_CACHE,
+                base_url=Config.KIMI_BASE_URL,
+                model=Config.KIMI_MODEL,
+            )
+            llm_providers["kimi"] = kimi_llm
+        else:
+            print("⚠️ KIMI_API_KEY not set – Kimi provider will be unavailable.")
         
         db = ChromaDBManager(
             persist_directory=Config.CHROMA_DB_DIR,
@@ -115,12 +134,19 @@ async def startup_event():
             use_reranker=Config.USE_RERANKER
         )
         
-        print("✅ Chatbot initialized successfully!")
+        print(f"✅ Chatbot initialized! Available providers: {list(llm_providers.keys())}")
         
     except Exception as e:
         print(f"❌ Failed to initialize chatbot: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _get_llm(provider: Optional[str] = None) -> LLMProvider:
+    """Resolve the LLM provider for a request, falling back to DeepSeek."""
+    if provider and provider in llm_providers:
+        return llm_providers[provider]
+    return llm_providers.get("deepseek", chatbot_instance.llm)
 
 
 @app.get("/")
@@ -140,6 +166,19 @@ async def health():
         "status": "healthy",
         "chatbot_initialized": chatbot_instance is not None
     }
+
+
+@app.get("/api/providers")
+async def get_providers():
+    """List available LLM providers and their models"""
+    providers = []
+    for name, llm in llm_providers.items():
+        providers.append({
+            "id": name,
+            "label": "DeepSeek" if name == "deepseek" else "Kimi",
+            "model": llm.model_name,
+        })
+    return {"providers": providers, "default": "deepseek"}
 
 
 # ---- RBS (Room Booking System) Endpoints ----
@@ -359,7 +398,9 @@ async def chat_stream(request: ChatRequest):
             from src.utils import get_current_datetime_info
             from src.prompts import build_system_message, build_user_prompt, build_rbs_system_message, build_rbs_user_prompt
 
-            is_rbs = detect_rbs_intent(request.query, previous_was_rbs=_last_exchange_was_rbs)
+            selected_llm = _get_llm(request.provider)
+
+            is_rbs = detect_rbs_intent(selected_llm, request.query, previous_was_rbs=_last_exchange_was_rbs)
 
             # ---- RBS path ----
             if is_rbs:
@@ -393,7 +434,7 @@ async def chat_stream(request: ChatRequest):
 
                 generation_start = time.time()
                 full_response = ""
-                for chunk in chatbot_instance.llm.generate_response_stream(
+                for chunk in selected_llm.generate_response_stream(
                     prompt=user_prompt,
                     system_message=system_message,
                     conversation_history=conversation_history,
@@ -452,7 +493,7 @@ async def chat_stream(request: ChatRequest):
             
             generation_start = time.time()
             full_response = ""
-            for chunk in chatbot_instance.llm.generate_response_stream(
+            for chunk in selected_llm.generate_response_stream(
                 prompt=user_prompt,
                 system_message=system_message,
                 conversation_history=conversation_history
