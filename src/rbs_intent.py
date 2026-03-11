@@ -102,13 +102,21 @@ def detect_rbs_intent(
         return _detect_rbs_intent_keyword_fallback(query, previous_was_rbs)
 
 
-def extract_rbs_params(llm, query: str, rooms_list: List[Dict], today: Optional[str] = None) -> Dict:
+def extract_rbs_params(
+    llm,
+    query: str,
+    rooms_list: List[Dict],
+    today: Optional[str] = None,
+    conversation_history: Optional[List[Dict]] = None,
+) -> Dict:
     """Use a single LLM call to extract structured parameters from the user query.
 
     Returns a dict with keys:
-        intent:      one of list_rooms | room_schedule | find_free | search_all | my_bookings
+        intent:      one of list_rooms | room_schedule | find_free | search_all | my_bookings | book_room
         room_name:   str | None
-        date:        YYYY-MM-DD | None
+        date:        YYYY-MM-DD | None (for single-day queries)
+        date_from:   YYYY-MM-DD | None (start of a range, if user specifies one)
+        date_to:     YYYY-MM-DD | None (end of a range, if user specifies one)
         time_start:  HH:MM | None
         time_end:    HH:MM | None
     """
@@ -118,15 +126,33 @@ def extract_rbs_params(llm, query: str, rooms_list: List[Dict], today: Optional[
 
     room_names = [f"{r['id']} ({r['name']})" for r in rooms_list] if rooms_list else ["(room list unavailable)"]
 
+    history_block = ""
+    if conversation_history:
+        history_lines = []
+        for exchange in conversation_history[-3:]:
+            history_lines.append(f"User: {exchange.get('user_query', '')}")
+            resp = exchange.get("bot_response", "")
+            if len(resp) > 300:
+                resp = resp[:300] + "..."
+            history_lines.append(f"Assistant: {resp}")
+        history_block = (
+            "\nConversation history (use this to resolve follow-up references like "
+            "\"tomorrow\" or \"that room\" from previous turns):\n"
+            + "\n".join(history_lines)
+            + "\n"
+        )
+
     system_prompt = (
         "You are a structured-data extraction assistant. "
         "Given a user query about room bookings, extract the parameters as JSON. "
         "Respond ONLY with a JSON object — no markdown, no explanation.\n\n"
         "Output schema:\n"
         "{\n"
-        '  "intent": "list_rooms" | "room_schedule" | "find_free" | "search_all" | "my_bookings",\n'
+        '  "intent": "list_rooms" | "room_schedule" | "find_free" | "search_all" | "my_bookings" | "book_room",\n'
         '  "room_name": "<room id or name>" | null,\n'
         '  "date": "YYYY-MM-DD" | null,\n'
+        '  "date_from": "YYYY-MM-DD" | null,\n'
+        '  "date_to": "YYYY-MM-DD" | null,\n'
         '  "time_start": "HH:MM" | null,\n'
         '  "time_end": "HH:MM" | null\n'
         "}\n\n"
@@ -135,16 +161,32 @@ def extract_rbs_params(llm, query: str, rooms_list: List[Dict], today: Optional[
         "- room_schedule: user asks about a SPECIFIC room's schedule/bookings\n"
         "- find_free: user asks if a specific room is free at a certain time\n"
         "- search_all: user wants to find ANY available room (no specific room)\n"
-        "- my_bookings: user asks about their own bookings\n\n"
+        "- my_bookings: user asks about their own bookings\n"
+        "- book_room: user wants to BOOK a room or asks HOW to book (wants the booking link)\n\n"
+        "IMPORTANT — Conversation context:\n"
+        "The user may refer to dates, rooms, or times established in PREVIOUS turns.\n"
+        "For example, if the previous turn established \"tomorrow\" and the current query is\n"
+        "\"we are free at 2pm\", you MUST carry forward the date from the conversation.\n"
+        "Extract ALL parameters you can infer from both the current query AND the conversation history.\n"
+        "CRITICAL: When the user is correcting only ONE field (e.g. adjusting time after a duration error), "
+        "carry forward ALL other fields (dates, date ranges, rooms) from the conversation history unchanged.\n"
+        "DURATION RESPONSES: If the user says \"1 hour\" or \"2 hours\" and a start time was\n"
+        "established in a previous turn, calculate time_end by adding the duration to that start time.\n"
+        "For example: previous turn had time_start=14:00, user says \"2 hours\" → time_start=14:00, time_end=16:00.\n\n"
         "Date resolution:\n"
         f'- Today is {today} ({day_of_week}).\n'
-        '- "tomorrow" → the day after today.\n'
-        '- "next Monday" → the next occurrence of that weekday.\n'
-        "- If no date is mentioned, use today's date.\n\n"
+        '- If the user specifies a single specific date, set \"date\" to that date and leave \"date_from\" and \"date_to\" as null.\n'
+        '- If the user specifies a date range (e.g. \"March 16 to March 20\"), set \"date_from\" and \"date_to\" to the start and end dates and set \"date\" to null.\n'
+        '- \"today\", \"tomorrow\", \"this Monday\" etc. count as specifying a date — resolve them to YYYY-MM-DD.\n'
+        '- If a date or date RANGE (date_from/date_to) was established in a previous conversation turn '
+        'and the user has not changed it, carry ALL date fields forward.\n'
+        '- If the previous turn had date_from and date_to set (a date range), preserve both even if '
+        'the user is only correcting a different field like time.\n'
+        '- If no date is mentioned at all and no date was established in conversation history, set \"date\" to null (do NOT assume today).\n\n'
         f"Valid rooms:\n{chr(10).join(room_names)}"
     )
 
-    user_prompt = f"User query: {query}"
+    user_prompt = f"{history_block}User query: {query}"
 
     try:
         raw = llm.generate_response(
@@ -164,9 +206,27 @@ def extract_rbs_params(llm, query: str, rooms_list: List[Dict], today: Optional[
 
     params.setdefault("intent", "room_schedule")
     params.setdefault("room_name", None)
-    params.setdefault("date", today)
+    params.setdefault("date", None)
+    params.setdefault("date_from", None)
+    params.setdefault("date_to", None)
     params.setdefault("time_start", None)
     params.setdefault("time_end", None)
+
+    # Post-processing: if query mentions a duration ("1 hour", "2 hours") and
+    # time_start is set but time_end is not, compute time_end.
+    if params.get("time_start") and not params.get("time_end"):
+        q_lower = query.lower()
+        duration_hours = None
+        if re.search(r"\b2\s*hours?\b", q_lower):
+            duration_hours = 2
+        elif re.search(r"\b1\s*hours?\b", q_lower):
+            duration_hours = 1
+        if duration_hours:
+            try:
+                ts = datetime.strptime(params["time_start"], "%H:%M")
+                params["time_end"] = (ts + timedelta(hours=duration_hours)).strftime("%H:%M")
+            except ValueError:
+                pass
 
     return params
 
@@ -174,7 +234,14 @@ def extract_rbs_params(llm, query: str, rooms_list: List[Dict], today: Optional[
 def _fallback_extract(query: str, rooms_list: List[Dict], today: str) -> Dict:
     """Regex-based fallback when LLM parsing fails."""
     q = query.lower()
-    result: Dict = {"intent": "room_schedule", "room_name": None, "date": today, "time_start": None, "time_end": None}
+    result: Dict = {"intent": "room_schedule", "room_name": None, "date": None, "time_start": None, "time_end": None}
+
+    if "today" in q:
+        result["date"] = today
+
+    if any(w in q for w in ("book a room", "how to book", "booking link", "want to book", "make a booking")):
+        result["intent"] = "book_room"
+        return result
 
     if any(w in q for w in ("my booking", "my reservation")):
         result["intent"] = "my_bookings"

@@ -1,6 +1,7 @@
 """RBS (Room Booking System) client for authenticated access to room data."""
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -399,20 +400,28 @@ class RBSClient:
         """Return rooms that are free during the given window.
 
         Rooms whose schedule could not be fetched are skipped (not assumed free).
+        Uses parallel fetching for speed.
         """
         rooms = self.get_rooms()
-        available = []
 
-        for room in rooms:
+        def _check_room(room: Dict) -> Optional[Dict]:
             sid = room.get("scheduler_id")
             if not sid:
-                continue
+                return None
             schedule = self.get_room_schedule(sid, date, room_code=room.get("id", ""))
             if schedule is None:
-                continue
+                return None
             if self._is_free(schedule, date, time_start, time_end):
-                available.append({**room, "schedule": schedule})
+                return {**room, "schedule": schedule}
+            return None
 
+        available = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_check_room, r): r for r in rooms}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    available.append(result)
         return available
 
     @staticmethod

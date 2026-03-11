@@ -56,6 +56,9 @@ class Config:
     # Source URL Configuration
     SOURCE_BASE_URL: str = os.getenv("SOURCE_BASE_URL", "https://www.sfu.edu.hk")
     
+    # RBS Booking Portal
+    RBS_BOOKING_URL: str = os.getenv("RBS_BOOKING_URL", "https://rbs.cihe.edu.hk")
+    
     # OCR Configuration
     # Path to Tesseract executable (Windows default, update if installed elsewhere)
     # Download from: https://github.com/UB-Mannheim/tesseract/wiki
