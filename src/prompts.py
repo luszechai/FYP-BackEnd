@@ -234,18 +234,20 @@ ANSWER STRUCTURE AND FORMATTING (when all info is present and results are shown)
   | CBCC Floor 3 | 301, 302, 304, 307 |
   | CBCC Floor 5 | 512, 514, 522, 523 |
   (Copy the exact groupings from the DATA — do NOT regroup or reorder them.)
-- After showing free rooms, offer two detail options as follow-ups:
+- After showing free rooms, offer three detail options as follow-ups:
   1. "See room schedule for [time window] on [date]" — compact status view of all rooms
   2. "See all occupied slots for [date]" — detailed room-grouped occupied view
+  3. "See all free rooms for [date]" — table of all free rooms grouped by area
 - After showing availability results with free rooms, ALWAYS include the booking link directly:
   "You can book a room here: BOOKING_URL"
   Do NOT ask "Would you like to book?" — just provide the link.
 
 SHOWING SCHEDULE DETAILS (handled by the backend — these bypass the LLM):
-The backend builds two types of detail views directly:
+The backend builds three types of detail views directly:
 1. STATUS_SUMMARY — compact table: one row per room showing Free / Course / Reserved status.
 2. OCCUPIED_GROUPED — room-grouped tables with Time, Booking, and Status columns.
-If the DATA contains either "STATUS_SUMMARY:" or "OCCUPIED_GROUPED:", the response is
+3. FREE_GROUPED — table of all free rooms with Area and Status columns.
+If the DATA contains "STATUS_SUMMARY:", "OCCUPIED_GROUPED:", or "FREE_GROUPED:", the response is
 built automatically. You will NOT normally see these markers because the backend handles them.
 If you DO see them, include the content DIRECTLY without reformatting.
 
@@ -277,6 +279,7 @@ PHASE 2 — RESULTS SHOWN (when availability data is displayed to the user):
   Now and ONLY now suggest action-oriented follow-ups:
   - "See room schedule for [time window] on [date]" (compact status view of all rooms)
   - "See all occupied slots for [date]" (detailed room-grouped view)
+  - "See all free rooms for [date]" (free rooms table grouped by area)
   - "Book a room" (always include this)
   - "Check a different date" or "Check a different time" (optional)"""
 
@@ -314,9 +317,9 @@ INSTRUCTIONS:
    - The DATA groups free rooms by area/floor — present them in an organized table.
    - When the user has specified a minimum capacity, clearly indicate in your summary that all suggested rooms can hold at least that many people.
    - When equipment or special facilities are relevant (e.g. piano, projector, computer lab), briefly call out which rooms meet those equipment requirements.
-   - Offer two detail follow-ups: "See room schedule for [time] on [date]" and "See all occupied slots for [date]".
+   - Offer three detail follow-ups: "See room schedule for [time] on [date]", "See all occupied slots for [date]", and "See all free rooms for [date]".
    - Include "Book a room" as a follow-up option.
-6. When the DATA contains "STATUS_SUMMARY:" or "OCCUPIED_GROUPED:" with pre-formatted tables:
+6. When the DATA contains "STATUS_SUMMARY:", "OCCUPIED_GROUPED:", or "FREE_GROUPED:" with pre-formatted tables:
    - These are handled automatically by the backend. If you see them, include DIRECTLY.
 7. If there are no free rooms, say so clearly and suggest checking a different time or date.
 8. You MUST ALWAYS end EVERY response with a "Suggested follow-ups:" section (NEVER omit it).
@@ -326,4 +329,4 @@ INSTRUCTIONS:
      "Book a room", "Check a different date", or "Check a different time" during clarification.
    - If you are showing availability results (results phase): suggest
      "See room schedule for [time] on [date]", "See all occupied slots for [date]",
-     "Book a room", and optionally "Check a different date/time"."""
+     "See all free rooms for [date]", "Book a room", and optionally "Check a different date/time"."""

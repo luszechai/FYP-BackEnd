@@ -539,15 +539,16 @@ def _build_rbs_context(
     # Intents that don't need date/time/room: list_rooms, my_bookings
     # --------------------------------------------------------------
     q_lower = (user_query or "").lower()
-    is_details_query = any(kw in q_lower for kw in ("occupied", "details", "slot"))
-    is_summary_query = any(kw in q_lower for kw in ("schedule", "status", "summary")) and not is_details_query
+    is_free_query = any(kw in q_lower for kw in ("free slot", "free room", "all free", "available room", "available slot", "unoccupied"))
+    is_details_query = any(kw in q_lower for kw in ("occupied", "details", "slot")) and not is_free_query
+    is_summary_query = any(kw in q_lower for kw in ("schedule", "status", "summary")) and not is_details_query and not is_free_query
 
-    if intent in ("room_schedule", "find_free") and not room_name and (is_details_query or is_summary_query):
+    if intent in ("room_schedule", "find_free") and not room_name and (is_details_query or is_summary_query or is_free_query):
         intent = "search_all"
         params["intent"] = "search_all"
 
     needs_date = intent not in ("list_rooms", "my_bookings")
-    needs_time = intent in ("search_all", "find_free") and not is_details_query and not is_summary_query
+    needs_time = intent in ("search_all", "find_free") and not is_details_query and not is_summary_query and not is_free_query
     missing_fields = []
 
     if time_start and not time_end:
@@ -806,7 +807,22 @@ def _build_rbs_context(
         else:
             lines.append(f"No free rooms found on {effective_date}{time_desc}.")
 
-        if is_summary_query:
+        if is_free_query:
+            lines.append("")
+            lines.append("FREE_GROUPED:")
+            lines.append("| Room | Area | Status |")
+            lines.append("|------|------|--------|")
+            all_codes = sorted(
+                [rs.get("id") or rs.get("name") or "" for rs in room_schedules_single],
+                key=lambda c: (not c[0].isdigit(), c),
+            )
+            free_set = set(free_codes)
+            for code in all_codes:
+                area = _room_area_label(code)
+                if code in free_set:
+                    lines.append(f"| {code} | {area} | Free |")
+
+        elif is_summary_query:
             # Compact status summary: one row per room (free + occupied), for the user's time window.
             lines.append("")
             lines.append("STATUS_SUMMARY:")
@@ -964,6 +980,40 @@ def _extract_free_rooms_text(rbs_context: str) -> str:
     return "\n".join(result) if result else ""
 
 
+def _build_free_grouped_response(rbs_context: str) -> str:
+    """Build a table of all free rooms grouped by area, bypass LLM."""
+    date_label = _extract_date_label(rbs_context)
+    booking_url = Config.RBS_BOOKING_URL
+
+    table_lines: List[str] = []
+    in_table = False
+    for line in rbs_context.split("\n"):
+        if line == "FREE_GROUPED:":
+            in_table = True
+            continue
+        if in_table:
+            if line.strip() == "" and table_lines:
+                break
+            table_lines.append(line)
+
+    free_count = sum(1 for l in table_lines if "| Free |" in l)
+    parts: List[str] = [
+        f"Here are the free rooms on **{date_label}** ({free_count} rooms):\n",
+    ]
+
+    if table_lines:
+        parts.append("\n".join(table_lines))
+        parts.append("")
+
+    parts.append(f"You can book a room here: **{booking_url}**\n")
+    parts.append("Suggested follow-ups:")
+    parts.append(f"- See all occupied slots for {date_label}")
+    parts.append("- Book a room")
+    parts.append("- Check a different date")
+
+    return "\n".join(parts)
+
+
 def _build_status_summary_response(rbs_context: str) -> str:
     """Build a compact room-status-summary response (free + occupied), bypass LLM."""
     date_label = _extract_date_label(rbs_context)
@@ -992,6 +1042,7 @@ def _build_status_summary_response(rbs_context: str) -> str:
 
     parts.append(f"You can book a room here: **{booking_url}**\n")
     parts.append("Suggested follow-ups:")
+    parts.append(f"- See all free rooms for {date_label}")
     parts.append(f"- See all occupied slots for {date_label}")
     parts.append("- Check a different date")
     parts.append("- Check a different time")
@@ -1023,6 +1074,7 @@ def _build_occupied_grouped_response(rbs_context: str) -> str:
 
     parts.append(f"You can book a room here: **{booking_url}**\n")
     parts.append("Suggested follow-ups:")
+    parts.append(f"- See all free rooms for {date_label}")
     time_window = _extract_time_window(rbs_context)
     if time_window:
         parts.append(f"- See room schedule for {time_window} on {date_label}")
@@ -1086,7 +1138,10 @@ async def chat_stream(request: ChatRequest):
                 await asyncio.sleep(0)
 
                 # --- Direct-response bypass: build structured response, skip LLM ---
-                if "STATUS_SUMMARY:" in rbs_context:
+                if "FREE_GROUPED:" in rbs_context:
+                    generation_start = time.time()
+                    full_response = _build_free_grouped_response(rbs_context)
+                elif "STATUS_SUMMARY:" in rbs_context:
                     generation_start = time.time()
                     full_response = _build_status_summary_response(rbs_context)
                 elif "OCCUPIED_GROUPED:" in rbs_context:
