@@ -55,6 +55,35 @@ rbs_client: Optional[RBSClient] = None
 # so follow-up queries like "how about march 5" stay in the RBS flow.
 _last_exchange_was_rbs: bool = False
 
+# Schedule cache: avoids redundant round-trips to RBS within a conversation.
+_rbs_schedule_cache: Dict = {}
+_RBS_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_cached_schedules(req_from: str, req_to: str) -> Optional[List[Dict]]:
+    """Return cached room_schedules if the cache covers the requested date range and is fresh."""
+    if not _rbs_schedule_cache:
+        return None
+    cached_from = _rbs_schedule_cache.get("date_from", "")
+    cached_to = _rbs_schedule_cache.get("date_to", "")
+    ts = _rbs_schedule_cache.get("timestamp", 0)
+    if time.time() - ts > _RBS_CACHE_TTL:
+        return None
+    if req_from >= cached_from and req_to <= cached_to:
+        return _rbs_schedule_cache["room_schedules"]
+    return None
+
+
+def _store_schedule_cache(date_from: str, date_to: str, room_schedules: List[Dict]):
+    """Store fetched room schedules in the module-level cache."""
+    global _rbs_schedule_cache
+    _rbs_schedule_cache = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "room_schedules": room_schedules,
+        "timestamp": time.time(),
+    }
+
 
 class ChatRequest(BaseModel):
     query: str
@@ -362,6 +391,16 @@ def _build_rbs_context(
         intent = "search_all"
         params["intent"] = "search_all"
 
+    # Optional capacity filter inferred from the user query, e.g. "80 people".
+    min_capacity: Optional[int] = None
+    if user_query:
+        m = re.search(r"\b(\d{1,3})\s*(people|persons|seats|capacity)\b", user_query, re.IGNORECASE)
+        if m:
+            try:
+                min_capacity = int(m.group(1))
+            except ValueError:
+                min_capacity = None
+
     # --------------------------------------------------------------
     # Pre-search validation: catch booking-rule violations BEFORE
     # any expensive room fetching.
@@ -501,13 +540,14 @@ def _build_rbs_context(
     # --------------------------------------------------------------
     q_lower = (user_query or "").lower()
     is_details_query = any(kw in q_lower for kw in ("occupied", "details", "slot"))
+    is_summary_query = any(kw in q_lower for kw in ("schedule", "status", "summary")) and not is_details_query
 
-    if intent in ("room_schedule", "find_free") and not room_name and is_details_query:
+    if intent in ("room_schedule", "find_free") and not room_name and (is_details_query or is_summary_query):
         intent = "search_all"
         params["intent"] = "search_all"
 
     needs_date = intent not in ("list_rooms", "my_bookings")
-    needs_time = intent in ("search_all", "find_free") and not is_details_query
+    needs_time = intent in ("search_all", "find_free") and not is_details_query and not is_summary_query
     missing_fields = []
 
     if time_start and not time_end:
@@ -594,6 +634,25 @@ def _build_rbs_context(
             return f"{code} {session}{groups}"
         return title
 
+    def _format_status_label(booking_type: str, status: str) -> str:
+        """Map raw booking_type + status to a user-friendly label."""
+        type_label = "Course" if booking_type == "class" else "Reserved"
+        status_label = {"approved": "Approved", "confirmed": "Confirmed", "pending": "Pending"}.get(status, status.capitalize() if status else "")
+        if status_label:
+            return f"{type_label} ({status_label})"
+        return type_label
+
+    def _room_area_label(code: str) -> str:
+        """Return the area label for a single room code."""
+        upper = code.upper()
+        if upper.startswith("SP"):
+            return "Library/Study Pod"
+        if upper.startswith("A"):
+            return "SFU"
+        if code[0].isdigit():
+            return f"CBCC Floor {code[0]}"
+        return "Other"
+
     def _group_rooms_by_area(codes: List[str]) -> str:
         """Group sorted room codes by area/floor for compact display."""
         from collections import OrderedDict
@@ -620,6 +679,17 @@ def _build_rbs_context(
 
     if intent == "search_all":
         # Decide on single-date vs date-range search.
+        # Apply optional capacity filter if the user specified a group size.
+        rooms_for_search = rooms_list
+        if min_capacity is not None:
+            def _cap_ok(room: dict) -> bool:
+                try:
+                    return int(room.get("capacity") or 0) >= min_capacity
+                except (ValueError, TypeError):
+                    return False
+
+            rooms_for_search = [r for r in rooms_list if _cap_ok(r)]
+
         if date_from and date_to:
             try:
                 start_dt = datetime.strptime(date_from, "%Y-%m-%d")
@@ -641,25 +711,34 @@ def _build_rbs_context(
                 range_dates.append(cur.strftime("%Y-%m-%d"))
                 cur += timedelta(days=1)
 
-            # Fetch each room's schedule once for the full range, in parallel.
-            def _check_room_range(room: dict) -> Optional[Dict]:
-                sid = room.get("scheduler_id")
-                if not sid:
-                    return None
-                schedule = client.get_room_schedule(
-                    sid, date_from, date_to, room_code=room.get("id", "")
-                )
-                if schedule is None:
-                    return None
-                return {**room, "schedule": schedule}
+            # Try cache first; fetch from RBS only on miss.
+            cached = _get_cached_schedules(date_from, date_to)
+            if cached is not None:
+                print("[RBS] Cache HIT for date-range search")
+                room_schedules = cached
+            else:
+                print("[RBS] Cache MISS — fetching from RBS")
+
+                def _check_room_range(room: dict) -> Optional[Dict]:
+                    sid = room.get("scheduler_id")
+                    if not sid:
+                        return None
+                    schedule = client.get_room_schedule(
+                        sid, date_from, date_to, room_code=room.get("id", "")
+                    )
+                    if schedule is None:
+                        return None
+                    return {**room, "schedule": schedule}
 
             room_schedules: List[Dict] = []
             with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(_check_room_range, r): r for r in rooms_list}
+                futures = {executor.submit(_check_room_range, r): r for r in rooms_for_search}
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         room_schedules.append(result)
+
+            _store_schedule_cache(date_from, date_to, room_schedules)
 
             # Build per-day summary by checking each room's cached schedule in-memory
             summary_lines: List[str] = []
@@ -681,22 +760,32 @@ def _build_rbs_context(
         # No explicit range: single-date search with both free + occupied data.
         effective_date = date or ""
 
-        def _fetch_room_single(room: dict) -> Optional[Dict]:
-            sid = room.get("scheduler_id")
-            if not sid:
-                return None
-            sched = client.get_room_schedule(sid, effective_date, room_code=room.get("id", ""))
-            if sched is None:
-                return None
-            return {**room, "schedule": sched}
+        # Try cache first (single date is a subset of any range that covers it).
+        cached_single = _get_cached_schedules(effective_date, effective_date)
+        if cached_single is not None:
+            print("[RBS] Cache HIT for single-date search")
+            room_schedules_single = cached_single
+        else:
+            print("[RBS] Cache MISS — fetching from RBS (single date)")
 
-        room_schedules_single: List[Dict] = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futs = {executor.submit(_fetch_room_single, r): r for r in rooms_list}
-            for f in as_completed(futs):
-                res = f.result()
-                if res:
-                    room_schedules_single.append(res)
+            def _fetch_room_single(room: dict) -> Optional[Dict]:
+                sid = room.get("scheduler_id")
+                if not sid:
+                    return None
+                sched = client.get_room_schedule(sid, effective_date, room_code=room.get("id", ""))
+                if sched is None:
+                    return None
+                return {**room, "schedule": sched}
+
+            room_schedules_single: List[Dict] = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futs = {executor.submit(_fetch_room_single, r): r for r in rooms_for_search}
+                for f in as_completed(futs):
+                    res = f.result()
+                    if res:
+                        room_schedules_single.append(res)
+
+            _store_schedule_cache(effective_date, effective_date, room_schedules_single)
 
         free_codes: List[str] = []
         occupied_rooms_data: List[Dict] = []
@@ -717,30 +806,66 @@ def _build_rbs_context(
         else:
             lines.append(f"No free rooms found on {effective_date}{time_desc}.")
 
-        if is_details_query and occupied_rooms_data:
-            # Pre-formatted markdown table sorted by time (LLM includes this verbatim)
-            all_events = []
+        if is_summary_query:
+            # Compact status summary: one row per room (free + occupied), for the user's time window.
+            lines.append("")
+            lines.append("STATUS_SUMMARY:")
+            lines.append("| Room | Status | Details |")
+            lines.append("|------|--------|---------|")
+            all_codes = sorted(
+                [rs.get("id") or rs.get("name") or "" for rs in room_schedules_single],
+                key=lambda c: (not c[0].isdigit(), c),
+            )
+            occupied_map: Dict[str, List[Dict]] = {}
             for rs in occupied_rooms_data:
                 code = rs.get("id") or rs.get("name") or ""
                 for ev in rs["schedule"]:
                     if ev.get("date") != effective_date:
                         continue
-                    btype = ev.get("booking_type", "")
-                    title = "Reserved" if btype == "reserved" else (ev.get("title") or "Booked")
-                    all_events.append({
-                        "start": ev.get("start_time", "?"),
-                        "end": ev.get("end_time", "?"),
-                        "room": code,
-                        "booking": title,
-                    })
-            all_events.sort(key=lambda x: (x["start"], x["room"]))
+                    occupied_map.setdefault(code, []).append(ev)
+            free_set = set(free_codes)
+            for code in all_codes:
+                if code in free_set:
+                    lines.append(f"| {code} | Free | – |")
+                else:
+                    evts = occupied_map.get(code, [])
+                    if evts:
+                        ev = evts[0]
+                        btype = ev.get("booking_type", "")
+                        status = ev.get("status", "")
+                        title = "Reserved" if btype == "reserved" else (ev.get("title") or "Booked")
+                        label = _format_status_label(btype, status)
+                        lines.append(f"| {code} | {label} | {title} |")
+                    else:
+                        lines.append(f"| {code} | Occupied | – |")
+
+        elif is_details_query and occupied_rooms_data:
+            # Room-grouped occupied table with status column.
+            room_events: Dict[str, List[Dict]] = {}
+            for rs in occupied_rooms_data:
+                code = rs.get("id") or rs.get("name") or ""
+                for ev in rs["schedule"]:
+                    if ev.get("date") != effective_date:
+                        continue
+                    room_events.setdefault(code, []).append(ev)
+            sorted_codes = sorted(room_events, key=lambda c: (not c[0].isdigit(), c))
+            for code in sorted_codes:
+                room_events[code].sort(key=lambda e: e.get("start_time", ""))
 
             lines.append("")
-            lines.append("OCCUPIED_TABLE:")
-            lines.append("| Time | Room | Booking |")
-            lines.append("|------|------|---------|")
-            for ev in all_events:
-                lines.append(f"| {ev['start']}–{ev['end']} | {ev['room']} | {ev['booking']} |")
+            lines.append("OCCUPIED_GROUPED:")
+            for code in sorted_codes:
+                area = _room_area_label(code)
+                lines.append(f"\n**Room {code}** ({area})")
+                lines.append("| Time | Booking | Status |")
+                lines.append("|------|---------|--------|")
+                for ev in room_events[code]:
+                    btype = ev.get("booking_type", "")
+                    status = ev.get("status", "")
+                    title = "Reserved" if btype == "reserved" else (ev.get("title") or "Booked")
+                    label = _format_status_label(btype, status)
+                    lines.append(f"| {ev.get('start_time', '?')}–{ev.get('end_time', '?')} | {title} | {label} |")
+
         elif occupied_rooms_data:
             lines.append(f"\n{len(occupied_rooms_data)} rooms are occupied on {effective_date}.")
 
@@ -806,38 +931,101 @@ def _build_rbs_context(
     return "Unsupported room booking request."
 
 
-def _build_direct_occupied_response(rbs_context: str) -> str:
-    """Build a complete markdown response for occupied-details queries without the LLM."""
+def _extract_date_label(rbs_context: str) -> str:
+    """Extract a human-readable date label from the context."""
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", rbs_context)
     if date_match:
         try:
             dt = datetime.strptime(date_match.group(1), "%Y-%m-%d")
-            date_label = dt.strftime("%A, %B %d, %Y")
+            return dt.strftime("%A, %B %d, %Y")
         except ValueError:
-            date_label = date_match.group(1)
-    else:
-        date_label = "the requested date"
+            return date_match.group(1)
+    return "the requested date"
+
+
+def _extract_time_window(rbs_context: str) -> str:
+    """Extract the time window description (e.g. 'between 15:00 and 16:00') from context."""
+    m = re.search(r"between (\d{2}:\d{2}) and (\d{2}:\d{2})", rbs_context)
+    if m:
+        return f"**{m.group(1)} – {m.group(2)}**"
+    return ""
+
+
+def _extract_free_rooms_text(rbs_context: str) -> str:
+    """Extract the FREE rooms lines from rbs_context for inclusion in responses."""
+    result = []
+    for line in rbs_context.split("\n"):
+        if line.startswith("FREE rooms") or (result and not line.startswith(("STATUS_SUMMARY:", "OCCUPIED_GROUPED:", "OCCUPIED_TABLE:"))):
+            if line.startswith(("STATUS_SUMMARY:", "OCCUPIED_GROUPED:", "OCCUPIED_TABLE:")):
+                break
+            result.append(line)
+        elif result and line.strip() == "":
+            break
+    return "\n".join(result) if result else ""
+
+
+def _build_status_summary_response(rbs_context: str) -> str:
+    """Build a compact room-status-summary response (free + occupied), bypass LLM."""
+    date_label = _extract_date_label(rbs_context)
+    time_window = _extract_time_window(rbs_context)
+    booking_url = Config.RBS_BOOKING_URL
 
     table_lines: List[str] = []
     in_table = False
     for line in rbs_context.split("\n"):
-        if line == "OCCUPIED_TABLE:":
+        if line == "STATUS_SUMMARY:":
             in_table = True
             continue
         if in_table:
+            if line.strip() == "" and table_lines:
+                break
             table_lines.append(line)
 
+    time_label = f" for {time_window}" if time_window else ""
     parts: List[str] = [
-        f"Here are the occupied slot details for **{date_label}**:\n",
+        f"Here is the room schedule{time_label} on **{date_label}**:\n",
     ]
 
     if table_lines:
         parts.append("\n".join(table_lines))
         parts.append("")
 
-    booking_url = Config.RBS_BOOKING_URL
     parts.append(f"You can book a room here: **{booking_url}**\n")
     parts.append("Suggested follow-ups:")
+    parts.append(f"- See all occupied slots for {date_label}")
+    parts.append("- Check a different date")
+    parts.append("- Check a different time")
+
+    return "\n".join(parts)
+
+
+def _build_occupied_grouped_response(rbs_context: str) -> str:
+    """Build a room-grouped occupied details response with status, bypass LLM."""
+    date_label = _extract_date_label(rbs_context)
+    booking_url = Config.RBS_BOOKING_URL
+
+    grouped_lines: List[str] = []
+    in_section = False
+    for line in rbs_context.split("\n"):
+        if line == "OCCUPIED_GROUPED:":
+            in_section = True
+            continue
+        if in_section:
+            grouped_lines.append(line)
+
+    parts: List[str] = [
+        f"Here are the occupied slot details for **{date_label}**:\n",
+    ]
+
+    if grouped_lines:
+        parts.append("\n".join(grouped_lines))
+        parts.append("")
+
+    parts.append(f"You can book a room here: **{booking_url}**\n")
+    parts.append("Suggested follow-ups:")
+    time_window = _extract_time_window(rbs_context)
+    if time_window:
+        parts.append(f"- See room schedule for {time_window} on {date_label}")
     parts.append("- Check a different date")
     parts.append("- Check a different time")
 
@@ -897,10 +1085,17 @@ async def chat_stream(request: ChatRequest):
                 yield f"data: {json.dumps({'type': 'metadata', 'sources': [], 'enhanced_query': {'original': request.query, 'is_rbs': True}})}\n\n"
                 await asyncio.sleep(0)
 
-                # --- Occupied-details bypass: build the response directly, skip LLM ---
-                if "OCCUPIED_TABLE:" in rbs_context:
+                # --- Direct-response bypass: build structured response, skip LLM ---
+                if "STATUS_SUMMARY:" in rbs_context:
                     generation_start = time.time()
-                    full_response = _build_direct_occupied_response(rbs_context)
+                    full_response = _build_status_summary_response(rbs_context)
+                elif "OCCUPIED_GROUPED:" in rbs_context:
+                    generation_start = time.time()
+                    full_response = _build_occupied_grouped_response(rbs_context)
+                else:
+                    full_response = None
+
+                if full_response is not None:
                     chunk_size = 180
                     for i in range(0, len(full_response), chunk_size):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': full_response[i:i+chunk_size]})}\n\n"

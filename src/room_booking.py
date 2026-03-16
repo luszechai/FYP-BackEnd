@@ -159,12 +159,26 @@ class RBSClient:
                     room_type = room_type[:idx].strip()
 
             capacity = ""
-            for j in range(i + 1, min(i + 12, len(lines))):
-                if lines[j].lower().startswith("capacity") and j + 1 < len(lines):
+            equipment: List[str] = []
+            remarks = ""
+
+            # Scan a limited window of lines below the card title for labelled fields.
+            for j in range(i + 1, min(i + 20, len(lines))):
+                lower = lines[j].lower()
+
+                if lower.startswith("capacity") and j + 1 < len(lines):
                     cap_val = lines[j + 1].strip()
                     if cap_val.isdigit():
                         capacity = cap_val
-                    break
+
+                elif lower.startswith("equipment") and j + 1 < len(lines):
+                    eq_line = lines[j + 1].strip()
+                    if eq_line:
+                        # Equipment items are often comma-separated; keep both raw and split form useful.
+                        equipment = [e.strip() for e in eq_line.split(",") if e.strip()]
+
+                elif lower.startswith("remarks") and j + 1 < len(lines):
+                    remarks = lines[j + 1].strip()
 
             rooms.append({
                 "id": room_number,
@@ -174,6 +188,8 @@ class RBSClient:
                 "floor": "",
                 "capacity": capacity,
                 "type": room_type,
+                "equipment": equipment,
+                "remarks": remarks,
             })
 
         # Filter out phantom entries: rooms parsed from page text that have
