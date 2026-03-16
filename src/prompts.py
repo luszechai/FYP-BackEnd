@@ -246,7 +246,7 @@ SHOWING SCHEDULE DETAILS (handled by the backend — these bypass the LLM):
 The backend builds three types of detail views directly:
 1. STATUS_SUMMARY — compact table: one row per room showing Free / Course / Reserved status.
 2. OCCUPIED_GROUPED — room-grouped tables with Time, Booking, and Status columns.
-3. FREE_GROUPED — table of all free rooms with Area and Status columns.
+3. FREE_GROUPED — room-grouped tables with Time and Status columns (free time slots per room).
 If the DATA contains "STATUS_SUMMARY:", "OCCUPIED_GROUPED:", or "FREE_GROUPED:", the response is
 built automatically. You will NOT normally see these markers because the backend handles them.
 If you DO see them, include the content DIRECTLY without reformatting.

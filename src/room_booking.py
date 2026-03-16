@@ -467,6 +467,70 @@ class RBSClient:
                 return False
         return True
 
+    @staticmethod
+    def _get_free_slots(
+        schedule: List[Dict], date: str,
+        time_filter_start: Optional[str] = None, time_filter_end: Optional[str] = None,
+    ) -> List[Tuple[str, str]]:
+        """Return list of (start_time, end_time) free intervals for the given date.
+        If time_filter_start/time_filter_end are set, only return free slots that overlap that window.
+        Day bounds: Mon-Fri 09:00-22:00, Sat 09:00-18:00."""
+        day_events = [e for e in schedule if e.get("date") == date]
+        try:
+            dt = datetime.strptime(date, "%Y-%m-%d")
+            day_start = "09:00"
+            day_end = "18:00" if dt.weekday() == 5 else "22:00"  # Sat=5
+        except ValueError:
+            day_start, day_end = "09:00", "22:00"
+
+        occupied = []
+        for e in day_events:
+            s, en = e.get("start_time"), e.get("end_time")
+            if s and en:
+                try:
+                    occupied.append((datetime.strptime(s, "%H:%M"), datetime.strptime(en, "%H:%M")))
+                except ValueError:
+                    pass
+        occupied.sort(key=lambda x: x[0])
+        # Merge overlapping
+        merged = []
+        for s, en in occupied:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], en))
+            else:
+                merged.append((s, en))
+
+        day_s = datetime.strptime(day_start, "%H:%M")
+        day_e = datetime.strptime(day_end, "%H:%M")
+        free = []
+        cur = day_s
+        for s, en in merged:
+            if cur < s:
+                slot_start = cur.strftime("%H:%M")
+                slot_end = min(s, day_e).strftime("%H:%M")
+                if slot_start < slot_end:
+                    free.append((slot_start, slot_end))
+            cur = max(cur, en)
+        if cur < day_e:
+            free.append((cur.strftime("%H:%M"), day_e.strftime("%H:%M")))
+
+        if time_filter_start and time_filter_end:
+            try:
+                f_start = datetime.strptime(time_filter_start, "%H:%M")
+                f_end = datetime.strptime(time_filter_end, "%H:%M")
+                filtered = []
+                for slot_s, slot_e in free:
+                    slot_start = datetime.strptime(slot_s, "%H:%M")
+                    slot_end = datetime.strptime(slot_e, "%H:%M")
+                    if slot_start < f_end and slot_end > f_start:
+                        overlap_s = max(slot_start, f_start).strftime("%H:%M")
+                        overlap_e = min(slot_end, f_end).strftime("%H:%M")
+                        filtered.append((overlap_s, overlap_e))
+                return filtered
+            except ValueError:
+                pass
+        return free
+
     # ------------------------------------------------------------------
     # My bookings
     # ------------------------------------------------------------------

@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
 import os
 import uuid
@@ -539,7 +539,7 @@ def _build_rbs_context(
     # Intents that don't need date/time/room: list_rooms, my_bookings
     # --------------------------------------------------------------
     q_lower = (user_query or "").lower()
-    is_free_query = any(kw in q_lower for kw in ("free slot", "free room", "all free", "available room", "available slot", "unoccupied"))
+    is_free_query = any(kw in q_lower for kw in ("free slot", "free room", "free rooms", "all free", "available room", "available slot", "unoccupied"))
     is_details_query = any(kw in q_lower for kw in ("occupied", "details", "slot")) and not is_free_query
     is_summary_query = any(kw in q_lower for kw in ("schedule", "status", "summary")) and not is_details_query and not is_free_query
 
@@ -549,19 +549,23 @@ def _build_rbs_context(
 
     needs_date = intent not in ("list_rooms", "my_bookings")
     needs_time = intent in ("search_all", "find_free") and not is_details_query and not is_summary_query and not is_free_query
-    missing_fields = []
+    missing_fields: List[str] = []
 
+    # Always prioritize asking for the date/date range first when nothing
+    # has been established yet, to keep clarification lightweight.
+    if needs_date and not (date or date_from or date_to):
+        missing_fields.append("date")
+
+    # Then handle time-related gaps (end time or generic "time").
     if time_start and not time_end:
         missing_fields.append("time_end")
 
     if needs_time and not time_start and not time_end:
         missing_fields.append("time")
 
+    # Room name is only required for room-specific intents.
     if intent in ("room_schedule", "find_free") and not room_name:
         missing_fields.append("room_name")
-
-    if needs_date and not (date or date_from or date_to):
-        missing_fields.append("date")
 
     if missing_fields:
         core_params = {
@@ -573,7 +577,10 @@ def _build_rbs_context(
             "time_start": time_start,
             "time_end": time_end,
         }
-        missing_str = ", ".join(sorted(set(missing_fields)))
+        # Preserve the order we appended in (date first, then time, then room_name).
+        seen = set()
+        ordered_missing = [m for m in missing_fields if not (m in seen or seen.add(m))]
+        missing_str = ", ".join(ordered_missing)
 
         lines = [
             f"MISSING: {missing_str}.",
@@ -808,19 +815,26 @@ def _build_rbs_context(
             lines.append(f"No free rooms found on {effective_date}{time_desc}.")
 
         if is_free_query:
+            # Room-grouped free slots: like OCCUPIED_GROUPED but for free intervals.
+            room_free_slots: Dict[str, List[Tuple[str, str]]] = {}
+            for rs in room_schedules_single:
+                code = rs.get("id") or rs.get("name") or ""
+                slots = RBSClient._get_free_slots(
+                    rs["schedule"], effective_date,
+                    time_filter_start=time_start, time_filter_end=time_end,
+                )
+                if slots:
+                    room_free_slots[code] = slots
+            sorted_codes = sorted(room_free_slots, key=lambda c: (not c[0].isdigit(), c))
             lines.append("")
             lines.append("FREE_GROUPED:")
-            lines.append("| Room | Area | Status |")
-            lines.append("|------|------|--------|")
-            all_codes = sorted(
-                [rs.get("id") or rs.get("name") or "" for rs in room_schedules_single],
-                key=lambda c: (not c[0].isdigit(), c),
-            )
-            free_set = set(free_codes)
-            for code in all_codes:
+            for code in sorted_codes:
                 area = _room_area_label(code)
-                if code in free_set:
-                    lines.append(f"| {code} | {area} | Free |")
+                lines.append(f"\n**Room {code}** ({area})")
+                lines.append("| Time | Status |")
+                lines.append("|------|--------|")
+                for slot_start, slot_end in room_free_slots[code]:
+                    lines.append(f"| {slot_start}–{slot_end} | Free |")
 
         elif is_summary_query:
             # Compact status summary: one row per room (free + occupied), for the user's time window.
@@ -981,32 +995,37 @@ def _extract_free_rooms_text(rbs_context: str) -> str:
 
 
 def _build_free_grouped_response(rbs_context: str) -> str:
-    """Build a table of all free rooms grouped by area, bypass LLM."""
+    """Build room-grouped free slot tables (Time | Status), bypass LLM."""
     date_label = _extract_date_label(rbs_context)
+    time_window = _extract_time_window(rbs_context)
     booking_url = Config.RBS_BOOKING_URL
 
-    table_lines: List[str] = []
-    in_table = False
+    grouped_lines: List[str] = []
+    in_section = False
     for line in rbs_context.split("\n"):
         if line == "FREE_GROUPED:":
-            in_table = True
+            in_section = True
             continue
-        if in_table:
-            if line.strip() == "" and table_lines:
+        if in_section:
+            if line.startswith(("STATUS_SUMMARY:", "OCCUPIED_GROUPED:", "FREE rooms on", "No free rooms")):
                 break
-            table_lines.append(line)
+            grouped_lines.append(line)
 
-    free_count = sum(1 for l in table_lines if "| Free |" in l)
-    parts: List[str] = [
-        f"Here are the free rooms on **{date_label}** ({free_count} rooms):\n",
-    ]
+    free_count = sum(1 for l in grouped_lines if l.strip().startswith("**Room "))
+    time_label = f" {time_window}" if time_window else ""
+    if free_count == 0:
+        parts: List[str] = [f"No free rooms found on **{date_label}**{time_label}.\n"]
+    else:
+        parts = [f"Here are the free rooms on **{date_label}**{time_label} ({free_count} rooms):\n"]
 
-    if table_lines:
-        parts.append("\n".join(table_lines))
+    if grouped_lines:
+        parts.append("\n".join(grouped_lines))
         parts.append("")
 
     parts.append(f"You can book a room here: **{booking_url}**\n")
     parts.append("Suggested follow-ups:")
+    if time_window:
+        parts.append(f"- See room schedule for {time_window} on {date_label}")
     parts.append(f"- See all occupied slots for {date_label}")
     parts.append("- Book a room")
     parts.append("- Check a different date")
@@ -1162,7 +1181,7 @@ async def chat_stream(request: ChatRequest):
                     yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
                     return
 
-                # --- Normal LLM path with dynamic max_tokens ---
+                # --- Normal LLM path with dynamic max_tokens and token budget ---
                 system_message = build_rbs_system_message(dt_info)
                 user_prompt = build_rbs_user_prompt(request.query, rbs_context, dt_info)
 
@@ -1170,9 +1189,40 @@ async def chat_stream(request: ChatRequest):
                 if request.use_memory and len(chatbot_instance.memory.history) > 0:
                     conversation_history = chatbot_instance.memory.get_recent_history(n=3)
 
+                # Approximate token usage (including conversation history)
+                # and ensure prompt + completion stay within the model
+                # context window. We estimate ~4 characters per token.
+                CONTEXT_LIMIT = 8192
+                MIN_COMPLETION = 512
+
+                def _estimate_tokens(sys_msg, usr_msg, history):
+                    total = len(sys_msg or '') + len(usr_msg or '')
+                    if history:
+                        for ex in history:
+                            total += len(ex.get('user_query', ''))
+                            total += len(ex.get('bot_response', ''))
+                    return max(total // 4, 1)
+
+                approx_prompt_tokens = _estimate_tokens(
+                    system_message, user_prompt, conversation_history
+                )
+
+                available = CONTEXT_LIMIT - approx_prompt_tokens - 200
+                # If history makes the prompt too large, progressively
+                # trim it until the completion budget is acceptable.
+                while available < MIN_COMPLETION and conversation_history:
+                    conversation_history = conversation_history[1:]
+                    if not conversation_history:
+                        conversation_history = None
+                    approx_prompt_tokens = _estimate_tokens(
+                        system_message, user_prompt, conversation_history
+                    )
+                    available = CONTEXT_LIMIT - approx_prompt_tokens - 200
+
+                available_for_completion = max(available, 256)
+
                 original_max_tokens = selected_llm.max_tokens
-                estimated = len(rbs_context) // 3 + 500
-                selected_llm.max_tokens = max(original_max_tokens, min(estimated, 8192))
+                selected_llm.max_tokens = min(original_max_tokens, available_for_completion)
 
                 generation_start = time.time()
                 full_response = ""
@@ -1271,7 +1321,7 @@ async def chat_stream(request: ChatRequest):
 @app.post("/api/clear")
 async def clear_memory():
     """Clear conversation memory and metrics"""
-    global _last_exchange_was_rbs
+    global _last_exchange_was_rbs, _rbs_schedule_cache
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
     
@@ -1279,8 +1329,13 @@ async def clear_memory():
     chatbot_instance.session_metrics = []
     chatbot_instance.clear_session_files()
     _last_exchange_was_rbs = False
+    # Also clear any cached RBS schedules so subsequent RBS queries
+    # fetch fresh data instead of reusing potentially stale cache.
+    _rbs_schedule_cache = {}
     
-    return {"message": "Memory, metrics, and session files cleared successfully"}
+    return {
+        "message": "Memory, metrics, session files, and RBS schedule cache cleared successfully"
+    }
 
 
 # ---- File Upload Endpoints ----
