@@ -1,14 +1,21 @@
 """Extractive context compression -- keeps only query-relevant sentences from each chunk."""
 from typing import List, Dict, Optional
+from datetime import datetime
 
 from src.llm_provider import LLMProvider
 
 _COMPRESS_SYSTEM = (
-    "You are an information extractor. Given a user question and a document chunk, "
+    "You are an information extractor. Given a user question, today's date, and a document chunk, "
     "extract ONLY the sentences that are directly relevant to answering the question. "
     "Rules:\n"
     "- Output the relevant sentences verbatim (do not paraphrase).\n"
     "- If nothing is relevant, output exactly: [IRRELEVANT]\n"
+    "- Check if the document contains time-sensitive information (e.g. event dates, deadlines, registration periods, application windows, limited-time announcements). "
+    "If the information is time-sensitive AND all the dates or deadlines mentioned have already "
+    "PASSED based on today's date, output exactly: [OUTDATED]\n"
+    "- Do NOT mark documents as [OUTDATED] if they contain general/permanent information "
+    "(e.g. tuition fees, program descriptions, contact info, policies, admission requirements) "
+    "even if they mention a year.\n"
     "- Do NOT add any commentary, headers, or explanations.\n"
     "- Preserve all facts, numbers, names, and dates exactly as written.\n"
     "- The question may have been translated or rewritten from another language. "
@@ -45,7 +52,9 @@ def compress_context(
             continue
 
         truncated = text[:_MAX_CHUNK_INPUT]
+        today_str = datetime.now().strftime("%B %d, %Y")
         prompt = (
+            f"Today's date: {today_str}\n"
             f"Question: {query}\n\n"
             f"Document chunk:\n{truncated}\n\n"
             "Extract only the sentences relevant to the question."
@@ -67,7 +76,10 @@ def compress_context(
                 llm.temperature = original_temp
 
             result = result.strip()
-            if result and "[IRRELEVANT]" not in result:
+            if "[OUTDATED]" in result:
+                src = doc.get("metadata", {}).get("source", "unknown")
+                print(f"  🗑️ Dropped outdated chunk (source: {src})")
+            elif result and "[IRRELEVANT]" not in result:
                 new_doc = dict(doc)
                 new_doc["document"] = result
                 new_doc["compressed"] = True

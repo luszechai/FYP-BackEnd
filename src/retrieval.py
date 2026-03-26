@@ -2,7 +2,7 @@
 from typing import List, Dict, Optional
 from src.vector_db import ChromaDBManager
 from src.bm25_search import BM25Search, reciprocal_rank_fusion
-from src.utils import is_scholarship_query
+from src.utils import is_scholarship_query, detect_email_category
 
 # Use only BM25 for retrieval; all other strategies (vector, expanded queries, keyword boosting) are disabled.
 BM25_ONLY = True
@@ -223,6 +223,50 @@ class HybridRetriever:
                 for doc in bm25_results:
                     doc['retrieval_score'] = doc.get('bm25_score', 1.0 / (doc.get('rank', 1) + 1))
                 all_results = {doc['id']: doc for doc in bm25_results}
+
+                # Boost: inject email documents when query matches an email category
+                email_cat = detect_email_category(raw_query)
+                if email_cat:
+                    where_filter = {"$and": [
+                        {"type": {"$eq": "email"}},
+                        {"email_type": {"$eq": email_cat}},
+                    ]}
+                    try:
+                        email_results = self.db.collection.get(
+                            where=where_filter,
+                            include=["documents", "metadatas"],
+                        )
+                    except Exception:
+                        email_results = {"ids": [], "documents": [], "metadatas": []}
+
+                    email_ids = email_results.get("ids", [])
+                    email_docs = email_results.get("documents", [])
+                    email_metas = email_results.get("metadatas", [])
+
+                    if email_ids:
+                        top_bm25 = max(
+                            (d.get("retrieval_score", 0) for d in all_results.values()),
+                            default=1.0,
+                        )
+                        inject_score = max(top_bm25, 1.0)
+                        injected = 0
+                        for idx, eid in enumerate(email_ids):
+                            if eid not in all_results:
+                                all_results[eid] = {
+                                    "id": eid,
+                                    "document": email_docs[idx] if idx < len(email_docs) else "",
+                                    "metadata": email_metas[idx] if idx < len(email_metas) else {},
+                                    "retrieval_score": inject_score,
+                                    "rank": 0,
+                                    "similarity": 0.0,
+                                }
+                                injected += 1
+                            else:
+                                all_results[eid]["retrieval_score"] = max(
+                                    all_results[eid]["retrieval_score"], inject_score
+                                )
+                        if injected:
+                            print(f"📧 Injected {injected} email doc(s) for category '{email_cat}'")
             else:
                 # Build a vector ranking list (sorted by current retrieval_score)
                 vector_ranking = sorted(

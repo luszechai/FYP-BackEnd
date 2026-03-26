@@ -248,15 +248,18 @@ class RAGChatbot:
         context_parts = []
         max_doc_length = 2000
 
-        for result in top_results:
+        for i, result in enumerate(top_results, start=1):
             section = result['metadata'].get('section', 'Unknown Section')
+            if section == 'email':
+                email_type = result['metadata'].get('email_type', '')
+                if email_type:
+                    section = f"email: {email_type}"
             content = result['document']
-            rank = result['rank']
             
             if len(content) > max_doc_length:
                 content = content[:max_doc_length] + "... [truncated]"
             
-            context_parts.append(f"[Document {rank} - {section}] (Score: {result['retrieval_score']:.3f})\n{content}")
+            context_parts.append(f"[Document {i} - {section}] (Score: {result['retrieval_score']:.3f})\n{content}")
 
         context_string = "\n\n---\n\n".join(context_parts)
         

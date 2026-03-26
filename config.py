@@ -20,17 +20,24 @@ class Config:
     # Kimi AI (Moonshot) Configuration
     KIMI_API_KEY: Optional[str] = os.getenv("KIMI_API_KEY")
     KIMI_BASE_URL: str = "https://api.moonshot.cn/v1"
-    KIMI_MODEL: str = "moonshot-v1-8k"
+    KIMI_MODEL: str = "kimi-k2.5"
+    # For kimi-k2.5: thinking mode uses temperature 1.0; non-thinking uses 0.6. Set False to allow temperature 0.6.
+    KIMI_DISABLE_THINKING: bool = os.getenv("KIMI_DISABLE_THINKING", "true").lower() in ("true", "1", "yes")
     
     # LLM Settings
-    LLM_TEMPERATURE: float = 0.3
+    LLM_TEMPERATURE: float = 0.6
     LLM_MAX_TOKENS: int = 1024
     LLM_ENABLE_CACHE: bool = True  # Enable response caching
     LLM_ENABLE_STREAMING: bool = False  # Enable streaming (set to True for better UX)
+    # Timeout in seconds for LLM API requests (Kimi can be slow to first token). Set in .env as LLM_REQUEST_TIMEOUT if needed.
+    LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
     
     # Vector Database Configuration
     CHROMA_DB_DIR: str = "./chroma_db"
     CHROMA_COLLECTION_NAME: str = "sfu_admission"
+    # Embedding and reranker models load from Hugging Face at startup. If you see ReadTimeoutError,
+    # set in .env: HF_HUB_ETAG_TIMEOUT=300, HF_HUB_DOWNLOAD_TIMEOUT=300. HF_HUB_OFFLINE=1 uses cache only
+    # (avoids timeouts but disables the reranker unless BAAI/bge-reranker-base is already cached).
     EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"
     
     # Text Splitting Configuration
@@ -71,7 +78,27 @@ class Config:
     MIN_TEXT_LENGTH_FOR_OCR: int = 100  # Trigger OCR if extracted text is shorter
     
     # Document Processing Configuration
-    SUPPORTED_EXTENSIONS: List[str] = [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"]
+    SUPPORTED_EXTENSIONS: List[str] = [
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tiff",
+        ".bmp",
+        ".txt",
+        ".csv",
+        ".docx",
+        ".xlsx",
+    ]
+    
+    # Email / IMAP Configuration (used by fetch_emails_to_rag.py)
+    EMAIL_IMAP_HOST: Optional[str] = os.getenv("EMAIL_IMAP_HOST")
+    EMAIL_IMAP_PORT: int = int(os.getenv("EMAIL_IMAP_PORT", "993"))
+    EMAIL_IMAP_USER: Optional[str] = os.getenv("EMAIL_IMAP_USER")
+    EMAIL_IMAP_PASSWORD: Optional[str] = os.getenv("EMAIL_IMAP_PASSWORD")
+    EMAIL_FROM_FILTER: Optional[str] = os.getenv("EMAIL_FROM_FILTER")
+    EMAIL_LAST_RUN_FILE: str = os.getenv("EMAIL_LAST_RUN_FILE", ".last_email_fetch")
+    EMAIL_ASSETS_DIR: str = os.getenv("EMAIL_ASSETS_DIR", "./email_assets")
     
     @classmethod
     def validate(cls):

@@ -154,30 +154,22 @@ def ingest_file(db: ChromaDBManager, file_path: str, args):
     """Ingest a single file"""
     ocr_config = get_ocr_config(args)
     metadata = build_metadata(args)
-    
-    # Determine file type and call appropriate method
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext == '.pdf':
-        chunks_added = db.add_documents_from_pdf(
-            pdf_path=file_path,
+
+    # Delegate to generic file ingestion; validation is handled there
+    try:
+        chunks_added = db.add_documents_from_file(
+            file_path=file_path,
             metadata=metadata,
-            min_text_length=ocr_config['min_text_length'],
-            ocr_language=ocr_config['ocr_language'],
-            tesseract_path=ocr_config['tesseract_path']
+            min_text_length=ocr_config["min_text_length"],
+            ocr_language=ocr_config["ocr_language"],
+            tesseract_path=ocr_config["tesseract_path"],
         )
-    elif ext in ['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp']:
-        chunks_added = db.add_documents_from_image(
-            image_path=file_path,
-            metadata=metadata,
-            ocr_language=ocr_config['ocr_language'],
-            tesseract_path=ocr_config['tesseract_path']
-        )
-    else:
-        print(f"❌ Unsupported file type: {ext}")
+    except ValueError as e:
+        # Unsupported extension or loader error
+        print(f"❌ Error ingesting file: {e}")
         print(f"   Supported: {', '.join(Config.SUPPORTED_EXTENSIONS)}")
         return 0
-    
+
     return chunks_added
 
 

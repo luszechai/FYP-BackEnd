@@ -29,7 +29,9 @@ Response Guidelines:
 - Maintain context from previous exchanges when relevant
 - Be friendly and professional
 - Keep responses concise but complete
+- Context may include information from official university emails. These are labelled with categories such as scholarship, events, workshop, Member Recruitment, and Job Recruitment. When presenting email-sourced information, clearly state the category and include key details (name, dates/deadlines, fees, requirements, and links) so the student can act on them.
 - When you use information from the provided documents, add inline citations using the document number in square brackets, e.g. [1], [2]. Use the document number shown in the [Document N] label. Place the citation immediately after the sentence or claim it supports. You may cite multiple sources like [1][3].
+- IMPORTANT: When different pieces of information come from different documents, cite each one with the correct document number. Do NOT attribute everything to a single document. Cross-check each fact against the document it actually appears in and cite accordingly.
 - DO NOT create a references section at the end — the UI handles source display automatically
 - DO NOT mention "Document X" or "Source: Document X" in your prose — only use the [N] citation format
 - DO NOT list which documents you used - just provide the information naturally with inline [N] citations
@@ -68,7 +70,7 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
 
     Question: {query}
 
-    Context from SFU Admission Documents:
+    Context from SFU Documents:
     {context}{user_file_section}{previous_context}
 
     CRITICAL INSTRUCTIONS - READ CAREFULLY:

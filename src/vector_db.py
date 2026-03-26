@@ -9,8 +9,6 @@ from chromadb.utils import embedding_functions
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .document_loader import DocumentLoaderFactory, PDFLoader, ImageLoader
-# text_cleaner disabled -- was stripping useful content during ingestion
-# from .text_cleaner import clean_text
 
 
 class ChromaDBManager:
@@ -168,6 +166,38 @@ class ChromaDBManager:
         documents = loader.load(image_path)
         return self._add_loaded_documents(documents, metadata)
 
+    def add_documents_from_file(
+        self,
+        file_path: str,
+        metadata: Optional[Dict] = None,
+        min_text_length: int = 100,
+        ocr_language: str = "eng+chi_sim+chi_tra",
+        tesseract_path: Optional[str] = None,
+    ) -> int:
+        """
+        Load and add documents from any supported file type (PDF, image, text, CSV, DOCX, XLSX).
+
+        Args:
+            file_path: Path to the file
+            metadata: Optional additional metadata to include
+            min_text_length: Minimum text length before triggering OCR for PDFs
+            ocr_language: Language for OCR
+            tesseract_path: Path to Tesseract executable
+
+        Returns:
+            Number of chunks added
+        """
+        print(f"📄 Processing file: {file_path}")
+
+        factory = DocumentLoaderFactory(
+            min_text_length=min_text_length,
+            ocr_language=ocr_language,
+            tesseract_path=tesseract_path,
+        )
+
+        documents = factory.load(file_path)
+        return self._add_loaded_documents(documents, metadata)
+
     def add_documents_from_directory(
         self,
         directory: str,
@@ -271,6 +301,17 @@ class ChromaDBManager:
                     chunk_metadata['image_size'] = doc_metadata['image_size']
                 if 'format' in doc_metadata:
                     chunk_metadata['format'] = doc_metadata['format']
+
+                # Add email-specific structured fields
+                for email_field in (
+                    'email_type', 'email_name', 'email_period', 'email_details',
+                    'email_fees', 'email_time', 'email_requirements', 'email_links',
+                    'email_subject', 'email_date',
+                    'email_id', 'email_categorized_links', 'email_images',
+                    'email_has_html',
+                ):
+                    if doc_metadata.get(email_field):
+                        chunk_metadata[email_field] = doc_metadata[email_field]
                 
                 # Merge extra metadata if provided
                 if extra_metadata:

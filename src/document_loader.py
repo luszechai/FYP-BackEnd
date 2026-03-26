@@ -6,8 +6,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from abc import ABC, abstractmethod
 
-# text_cleaner disabled -- was stripping useful content during ingestion
-# from src.text_cleaner import remove_boilerplate, clean_text
+from src.text_cleaner import remove_boilerplate, clean_text
 
 
 def _resolve_tesseract_path(path: str) -> str:
@@ -465,6 +464,81 @@ class DocxLoader(DocumentLoader):
             raise Exception(f"Error loading DOCX {file_path}: {e}")
 
 
+class XlsxLoader(DocumentLoader):
+    """
+    Loader for XLSX files (.xlsx).
+    Uses openpyxl to extract text from Excel workbooks.
+    """
+
+    SUPPORTED_EXTENSIONS = {'.xlsx'}
+
+    def __init__(self):
+        try:
+            import openpyxl  # type: ignore  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "openpyxl is required for .xlsx support. "
+                "Install with: pip install openpyxl"
+            ) from e
+
+    def load(self, file_path: str) -> List[Dict]:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"XLSX file not found: {file_path}")
+
+        try:
+            import openpyxl
+        except ImportError as e:
+            raise ImportError(
+                "openpyxl is required for .xlsx support. "
+                "Install with: pip install openpyxl"
+            ) from e
+
+        doc_id = self.generate_doc_id(file_path)
+        date_meta = self.get_file_dates(file_path)
+
+        print(f"📊 Loading XLSX file: {os.path.basename(file_path)}")
+
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            sheet_texts: List[str] = []
+
+            for sheet in wb.worksheets:
+                rows_text: List[str] = []
+                for row in sheet.iter_rows(values_only=True):
+                    if not row:
+                        continue
+                    cells = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
+                    if cells:
+                        rows_text.append(" | ".join(cells))
+
+                if rows_text:
+                    sheet_header = f"Sheet: {sheet.title}"
+                    sheet_body = "\n".join(rows_text)
+                    sheet_texts.append(f"{sheet_header}\n{sheet_body}")
+
+            if not sheet_texts:
+                print("  ⚠️ No text extracted from XLSX")
+                return []
+
+            full_text = "\n\n".join(sheet_texts)
+            print(f"  ✅ Extracted {len(full_text)} characters from {len(wb.worksheets)} sheet(s)")
+
+            return [{
+                "content": full_text,
+                "metadata": {
+                    "source": file_path,
+                    "type": "xlsx",
+                    "format": "xlsx",
+                    "extraction_method": "openpyxl",
+                    "parent_doc_id": doc_id,
+                    "sheet_names": [sheet.title for sheet in wb.worksheets],
+                    **date_meta,
+                },
+            }]
+        except Exception as e:
+            raise Exception(f"Error loading XLSX {file_path}: {e}")
+
+
 class DocumentLoaderFactory:
     """
     Factory class that auto-detects file type and returns appropriate loader.
@@ -475,6 +549,7 @@ class DocumentLoaderFactory:
     TEXT_EXTENSIONS = {'.txt'}
     CSV_EXTENSIONS = {'.csv'}
     DOCX_EXTENSIONS = {'.docx'}
+    XLSX_EXTENSIONS = {'.xlsx'}
     
     def __init__(
         self,
@@ -523,6 +598,8 @@ class DocumentLoaderFactory:
             return CSVLoader()
         elif ext in self.DOCX_EXTENSIONS:
             return DocxLoader()
+        elif ext in self.XLSX_EXTENSIONS:
+            return XlsxLoader()
         else:
             raise ValueError(
                 f"Unsupported file type: {ext}. "
@@ -530,7 +607,8 @@ class DocumentLoaderFactory:
                 f"Images ({', '.join(self.IMAGE_EXTENSIONS)}), "
                 f"Text ({', '.join(self.TEXT_EXTENSIONS)}), "
                 f"CSV ({', '.join(self.CSV_EXTENSIONS)}), "
-                f"DOCX ({', '.join(self.DOCX_EXTENSIONS)})"
+                f"DOCX ({', '.join(self.DOCX_EXTENSIONS)}), "
+                f"XLSX ({', '.join(self.XLSX_EXTENSIONS)})"
             )
     
     def load(self, file_path: str) -> List[Dict]:
@@ -568,7 +646,14 @@ class DocumentLoaderFactory:
         
         # Default to all supported extensions
         if extensions is None:
-            extensions = list(self.PDF_EXTENSIONS | self.IMAGE_EXTENSIONS | self.TEXT_EXTENSIONS | self.CSV_EXTENSIONS | self.DOCX_EXTENSIONS)
+            extensions = list(
+                self.PDF_EXTENSIONS
+                | self.IMAGE_EXTENSIONS
+                | self.TEXT_EXTENSIONS
+                | self.CSV_EXTENSIONS
+                | self.DOCX_EXTENSIONS
+                | self.XLSX_EXTENSIONS
+            )
         
         # Normalize extensions
         extensions = [ext.lower() if ext.startswith('.') else f'.{ext.lower()}' 

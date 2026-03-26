@@ -43,6 +43,7 @@ Pillow>=10.0.0
 
 # Document Processing
 python-docx>=1.1.0
+openpyxl>=3.1.0
 
 # Ragas Evaluation
 ragas>=0.2.0

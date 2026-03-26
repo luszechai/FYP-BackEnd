@@ -1,6 +1,6 @@
 """Utility functions for the chatbot"""
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 import re
 
 
@@ -31,6 +31,24 @@ def is_scholarship_query(query: str) -> bool:
     query_lower = query.lower()
     scholarship_keywords = ['scholarship', 'deadline', 'due date', 'application date', 'when']
     return any(keyword in query_lower for keyword in scholarship_keywords)
+
+
+_EMAIL_CATEGORIES = {
+    "scholarship": ["scholarship", "bursary", "financial aid", "獎學金"],
+    "events":      ["event", "activity", "活動", "trip", "tour", "考察"],
+    "workshop":    ["workshop", "seminar", "training", "工作坊"],
+    "Member Recruitment": ["member recruitment", "club recruitment", "join club", "成員招募"],
+    "Job Recruitment":    ["job recruitment", "job posting", "volunteer", "hiring", "職位招募"],
+}
+
+
+def detect_email_category(query: str) -> Optional[str]:
+    """Return the email_type if the query matches an email category, else None."""
+    q = query.lower()
+    for cat, keywords in _EMAIL_CATEGORIES.items():
+        if any(kw in q for kw in keywords):
+            return cat
+    return None
 
 
 def should_skip_retrieval(query: str) -> bool:

@@ -1,11 +1,42 @@
 """FastAPI server for SFU Admission Chatbot"""
+import os
+# Load .env and set HF timeouts before ANY other import (avoids ReadTimeoutError on slow networks).
+# Must patch constants and requests so no code path uses the default 10s for Hugging Face.
+from dotenv import load_dotenv
+load_dotenv()
+_hf_timeout = int(os.environ.get("HF_HUB_ETAG_TIMEOUT", "300") or "300")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(_hf_timeout))
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(_hf_timeout))
+try:
+    import huggingface_hub.constants as _hf_constants
+    _t = _hf_timeout
+    _d = int(os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT", "300") or "300")
+    _hf_constants.HF_HUB_ETAG_TIMEOUT = _t
+    _hf_constants.HF_HUB_DOWNLOAD_TIMEOUT = _d
+    _hf_constants.DEFAULT_ETAG_TIMEOUT = _t
+    _hf_constants.DEFAULT_DOWNLOAD_TIMEOUT = _d
+    if hasattr(_hf_constants, "DEFAULT_REQUEST_TIMEOUT"):
+        _hf_constants.DEFAULT_REQUEST_TIMEOUT = _d
+except ImportError:
+    pass
+# Ensure requests to huggingface.co never use a short timeout (some code paths may bypass constants).
+try:
+    import requests
+    _orig_request = requests.Session.request
+    def _request_with_hf_timeout(self, method, url, *args, **kwargs):
+        if isinstance(url, str) and "huggingface.co" in url:
+            kwargs["timeout"] = _hf_timeout  # force long timeout; hub often passes 10
+        return _orig_request(self, method, url, *args, **kwargs)
+    requests.Session.request = _request_with_hf_timeout
+except ImportError:
+    pass
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
-import os
 import uuid
 import tempfile
 import pandas as pd
@@ -41,6 +72,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_email_assets = os.path.abspath(Config.EMAIL_ASSETS_DIR)
+os.makedirs(_email_assets, exist_ok=True)
+app.mount("/email_assets", StaticFiles(directory=_email_assets), name="email_assets")
 
 # Global chatbot instance
 chatbot_instance: Optional[RAGChatbot] = None
@@ -116,18 +151,17 @@ class HistoryResponse(BaseModel):
 async def startup_event():
     """Initialize chatbot on startup"""
     global chatbot_instance, llm_providers
-    
     try:
         Config.validate()
         
         print("🔧 Setting up chatbot components...")
-        
         llm = LLMProvider(
             provider="deepseek",
             api_key=Config.DEEPSEEK_API_KEY,
             temperature=Config.LLM_TEMPERATURE,
             max_tokens=Config.LLM_MAX_TOKENS,
-            enable_cache=Config.LLM_ENABLE_CACHE
+            enable_cache=Config.LLM_ENABLE_CACHE,
+            request_timeout=Config.LLM_REQUEST_TIMEOUT,
         )
         llm_providers["deepseek"] = llm
         
@@ -140,6 +174,8 @@ async def startup_event():
                 enable_cache=Config.LLM_ENABLE_CACHE,
                 base_url=Config.KIMI_BASE_URL,
                 model=Config.KIMI_MODEL,
+                kimi_disable_thinking=Config.KIMI_DISABLE_THINKING,
+                request_timeout=Config.LLM_REQUEST_TIMEOUT,
             )
             llm_providers["kimi"] = kimi_llm
         else:
@@ -149,7 +185,6 @@ async def startup_event():
             persist_directory=Config.CHROMA_DB_DIR,
             collection_name=Config.CHROMA_COLLECTION_NAME
         )
-        
         if db.collection.count() == 0:
             if os.path.exists(Config.DATA_FILE):
                 db.add_documents_from_json(Config.DATA_FILE)
@@ -330,6 +365,43 @@ def deduplicate_sources(raw_sources: list) -> list:
     return sources
 
 
+def filter_cited_sources(response_text: str, sources: list) -> tuple:
+    """Keep only the sources that were actually cited as [N] in the response,
+    remap citation numbers to be sequential, and return (remapped_text, filtered_sources).
+    If no citations found, return originals unchanged."""
+    cited_numbers = sorted(set(int(m) for m in re.findall(r'\[(\d+)\]', response_text)))
+
+    if not cited_numbers or not sources:
+        return response_text, sources
+
+    old_to_new = {}
+    filtered = []
+    for new_num, old_num in enumerate(cited_numbers, start=1):
+        idx = old_num - 1
+        if 0 <= idx < len(sources):
+            old_to_new[old_num] = new_num
+            source_copy = dict(sources[idx])
+            source_copy['rank'] = new_num
+            source_copy['source_name'] = re.sub(
+                r'^Document \d+', f'Document {new_num}',
+                source_copy.get('source_name', f'Document {new_num}'),
+            )
+            filtered.append(source_copy)
+
+    if not filtered:
+        return response_text, sources
+
+    remapped = response_text
+    for old_num in sorted(old_to_new.keys(), reverse=True):
+        new_num = old_to_new[old_num]
+        if old_num != new_num:
+            remapped = remapped.replace(f'[{old_num}]', f'[__CITE_{new_num}__]')
+    for new_num in old_to_new.values():
+        remapped = remapped.replace(f'[__CITE_{new_num}__]', f'[{new_num}]')
+
+    return remapped, filtered
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Process a chat query"""
@@ -349,9 +421,10 @@ async def chat(request: ChatRequest):
         }
         
         sources = deduplicate_sources(response.get('sources', []))
+        answer, sources = filter_cited_sources(response['answer'], sources)
         
         return ChatResponse(
-            answer=response['answer'],
+            answer=answer,
             query=response['query'],
             performance=performance,
             sources=sources,
@@ -1304,13 +1377,15 @@ async def chat_stream(request: ChatRequest):
                 full_response,
                 [doc['id'] for doc in retrieved_docs]
             )
+
+            final_response, cited_sources = filter_cited_sources(full_response, sources)
             
             performance = {
                 "total_time": round(retrieval_time + generation_time, 3),
                 "retrieval_time": round(retrieval_time, 3),
                 "generation_time": round(generation_time, 3),
             }
-            yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'full_response': final_response, 'sources': cited_sources, 'performance': performance})}\n\n"
             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -1340,7 +1415,7 @@ async def clear_memory():
 
 # ---- File Upload Endpoints ----
 
-ALLOWED_UPLOAD_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.txt', '.csv', '.docx'}
+ALLOWED_UPLOAD_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.txt', '.csv', '.docx', '.xlsx'}
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
@@ -1515,6 +1590,127 @@ async def get_source(source_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving source: {str(e)}")
+
+
+@app.get("/api/emails")
+async def get_emails():
+    """Get all ingested emails grouped by category (scholarship, events, recruitment)."""
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+
+    try:
+        results = chatbot_instance.db.collection.get(
+            where={"type": "email"},
+            include=["metadatas", "documents"],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error querying emails: {e}")
+
+    email_chunks: dict = {}
+    metadatas = results.get("metadatas", [])
+    documents = results.get("documents", [])
+
+    for i, meta in enumerate(metadatas):
+        source = meta.get("source", "")
+        if not source:
+            continue
+        if source not in email_chunks:
+            email_chunks[source] = {
+                "meta": meta,
+                "chunks": [],
+            }
+        email_chunks[source]["chunks"].append({
+            "index": meta.get("chunk_index", 0),
+            "text": documents[i] if i < len(documents) else "",
+        })
+
+    seen_sources: dict = {}
+    for source, data in email_chunks.items():
+        meta = data["meta"]
+        sorted_chunks = sorted(data["chunks"], key=lambda c: c["index"])
+        full_content = "\n\n".join(c["text"] for c in sorted_chunks if c["text"])
+
+        eid = meta.get("email_id", "")
+
+        cat_links_raw = meta.get("email_categorized_links", "")
+        try:
+            cat_links = json.loads(cat_links_raw) if cat_links_raw else []
+        except (json.JSONDecodeError, TypeError):
+            flat = meta.get("email_links", "")
+            cat_links = [{"url": u, "category": "other"} for u in flat.split("\n") if u]
+
+        images_raw = meta.get("email_images", "")
+        try:
+            image_names = json.loads(images_raw) if images_raw else []
+        except (json.JSONDecodeError, TypeError):
+            image_names = []
+        image_urls = [
+            f"/email_assets/{eid}/images/{fname}" for fname in image_names
+        ] if eid else []
+
+        has_html = meta.get("email_has_html", "false") == "true"
+
+        seen_sources[source] = {
+            "name": meta.get("email_name", ""),
+            "subject": meta.get("email_subject", ""),
+            "date": meta.get("email_date", ""),
+            "type": meta.get("email_type", ""),
+            "introduction": meta.get("email_introduction", ""),
+            "period": meta.get("email_period", ""),
+            "application_period": meta.get("email_application_period", ""),
+            "event_period": meta.get("email_event_period", ""),
+            "details": meta.get("email_details", ""),
+            "fees": meta.get("email_fees", ""),
+            "time": meta.get("email_time", ""),
+            "event_time": meta.get("email_event_time", ""),
+            "requirements": meta.get("email_requirements", ""),
+            "links": meta.get("email_links", ""),
+            "content": full_content,
+            "email_id": eid,
+            "categorized_links": cat_links,
+            "images": image_urls,
+            "has_html": has_html,
+        }
+
+    grouped: dict = {
+        "scholarship": [],
+        "events": [],
+        "Member Recruitment": [],
+        "Job Recruitment": [],
+        "workshop": [],
+        "other": [],
+    }
+    for email_info in seen_sources.values():
+        category = (email_info.get("type") or "").strip()
+        cat_lower = category.lower()
+        if category in ("scholarship", "events"):
+            bucket = category
+        elif category in ("Member Recruitment", "Job Recruitment"):
+            bucket = category
+        elif cat_lower == "workshop":
+            bucket = "workshop"
+        elif category == "recruitment":
+            bucket = "other"
+        else:
+            bucket = "other"
+        grouped[bucket].append(email_info)
+
+    total = sum(len(v) for v in grouped.values())
+    return {"emails": grouped, "total": total}
+
+
+@app.get("/api/emails/{email_id}/html")
+async def get_email_html(email_id: str):
+    """Return the original HTML of an email as plain text."""
+    html_path = os.path.join(_email_assets, email_id, "original.html")
+    if not os.path.isfile(html_path):
+        raise HTTPException(status_code=404, detail="HTML not found for this email")
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return PlainTextResponse(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading HTML: {e}")
 
 
 @app.get("/api/stats", response_model=StatsResponse)
