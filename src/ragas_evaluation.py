@@ -7,10 +7,14 @@ against them, computing Ragas metrics, and formatting results.
 Used by both the standalone run_ragas_evaluation.py script and the
 /api/ragas/* API endpoints.
 """
+import hashlib
 import json
+import math
 import os
+import re
 import time
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Callable, Dict, List, Optional
 
 from ragas import evaluate
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
@@ -88,6 +92,7 @@ def run_pipeline_on_testset(
     chatbot,
     testset: List[Dict],
     max_questions: Optional[int] = None,
+    progress_callback: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """
     Run the RAG pipeline on each question in the testset and collect results.
@@ -97,6 +102,11 @@ def run_pipeline_on_testset(
         testset: List of testset items (each must have 'user_input').
         max_questions: Optional cap on how many questions to evaluate
                        (useful for quick test runs).
+        progress_callback: Optional callable invoked with status events:
+            {"type": "question_started", "index", "total", "question"}
+            {"type": "question_done", "index", "total", "latency_s", "num_contexts"}
+            {"type": "pipeline_done", "total"}
+          Used by the SSE endpoint to stream per-question progress to the UI.
 
     Returns:
         List of result dicts, each containing:
@@ -104,6 +114,7 @@ def run_pipeline_on_testset(
         - retrieved_contexts  (list of chunk text strings)
         - response            (generated answer)
         - reference           (ground-truth from testset, may be None)
+        - retrieved_docs_raw  (full doc dicts with metadata + scores, for Deep Dive)
     """
     items = testset[:max_questions] if max_questions else testset
     results: List[Dict] = []
@@ -119,9 +130,21 @@ def run_pipeline_on_testset(
             print(f"   ⚠️  Skipping item {idx}: no question text")
             continue
 
+        if progress_callback:
+            try:
+                progress_callback({
+                    "type": "question_started",
+                    "index": idx,
+                    "total": total,
+                    "question": question,
+                })
+            except Exception:
+                pass
+
         print(f"   [{idx}/{total}] {question[:80]}...")
 
         start = time.time()
+        retrieved_docs = []
         try:
             # Retrieve context
             retrieved_docs, context_string, _ = chatbot.retrieve_context(
@@ -147,14 +170,49 @@ def run_pipeline_on_testset(
         elapsed = time.time() - start
         print(f"       ⏱️ {elapsed:.2f}s | contexts={len(retrieved_contexts)}")
 
+        # Persist a lightweight copy of the source docs so the Deep Dive modal
+        # can show chunk scores/sections/parent_doc_ids without another lookup.
+        retrieved_docs_raw = []
+        for doc in retrieved_docs:
+            meta = doc.get("metadata", {}) or {}
+            retrieved_docs_raw.append({
+                "id": doc.get("id"),
+                "document": doc.get("document", ""),
+                "retrieval_score": round(float(doc.get("retrieval_score", 0.0)), 4),
+                "similarity": round(float(doc.get("similarity", 0.0) or 0.0), 4),
+                "section": meta.get("section"),
+                "source": meta.get("source"),
+                "parent_doc_id": meta.get("parent_doc_id"),
+            })
+
         results.append(
             {
                 "user_input": question,
                 "retrieved_contexts": retrieved_contexts,
                 "response": response,
                 "reference": reference,
+                "retrieved_docs_raw": retrieved_docs_raw,
+                "latency_s": round(elapsed, 3),
             }
         )
+
+        if progress_callback:
+            try:
+                progress_callback({
+                    "type": "question_done",
+                    "index": idx,
+                    "total": total,
+                    "latency_s": round(elapsed, 3),
+                    "num_contexts": len(retrieved_contexts),
+                })
+            except Exception:
+                pass
+
+    if progress_callback:
+        try:
+            progress_callback({"type": "pipeline_done", "total": len(results)})
+        except Exception:
+            pass
 
     print(f"✅ Pipeline completed for {len(results)} questions")
     return results
@@ -323,6 +381,126 @@ def save_results(eval_results: Dict, output_path: str = "eval_results.json"):
 
 def load_results(path: str = "eval_results.json") -> Optional[Dict]:
     """Load previously saved evaluation results. Returns None if not found."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# 6. Per-run storage for the evaluation dashboard
+# ---------------------------------------------------------------------------
+
+EVAL_RUNS_DIR = "eval_runs"
+_LABEL_SAFE_CHARS = re.compile(r"[^a-zA-Z0-9_\-]+")
+
+
+def compute_testset_hash(testset: List[Dict]) -> str:
+    """Short deterministic hash of the testset questions + references.
+
+    Used so the dashboard can show whether two runs were scored against
+    the same underlying testset (invalidates side-by-side comparisons when
+    the testset was regenerated after a dataset swap).
+    """
+    h = hashlib.sha1()
+    for item in testset:
+        q = item.get("user_input") or item.get("question") or ""
+        r = item.get("reference") or item.get("ground_truth") or ""
+        h.update(q.encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+        h.update(r.encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:12]
+
+
+def _slugify_label(label: str) -> str:
+    slug = _LABEL_SAFE_CHARS.sub("_", (label or "").strip())
+    slug = slug.strip("_")
+    return slug[:60] or "run"
+
+
+def build_run_id(label: Optional[str] = None, now: Optional[datetime] = None) -> str:
+    """Produce a filesystem-safe run id like ``20260424T140512_Optimized``."""
+    ts = (now or datetime.now()).strftime("%Y%m%dT%H%M%S")
+    slug = _slugify_label(label) if label else "run"
+    return f"{ts}_{slug}"
+
+
+def _sanitize_for_json(obj):
+    """Recursively convert NaN/Infinity floats to None.
+
+    Ragas occasionally emits NaN for per-question scores when a metric can't
+    be computed (e.g. no retrieved contexts). Python's default ``json.dump``
+    writes those as literal ``NaN`` which is not valid JSON and will choke
+    the browser's ``JSON.parse``.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def save_run(run: Dict, runs_dir: str = EVAL_RUNS_DIR) -> str:
+    """Persist a full evaluation run to ``runs_dir/<run_id>.json``.
+
+    ``run`` must contain at least an ``id`` field. Returns the path written.
+    """
+    os.makedirs(runs_dir, exist_ok=True)
+    run_id = run.get("id") or build_run_id(run.get("label"))
+    run["id"] = run_id
+    path = os.path.join(runs_dir, f"{run_id}.json")
+    clean = _sanitize_for_json(run)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False, default=str, allow_nan=False)
+    return path
+
+
+def list_runs(runs_dir: str = EVAL_RUNS_DIR) -> List[Dict]:
+    """Return run summaries (no per-question detail) sorted newest-first."""
+    if not os.path.isdir(runs_dir):
+        return []
+
+    summaries: List[Dict] = []
+    for fname in os.listdir(runs_dir):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(runs_dir, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        summaries.append({
+            "id": data.get("id") or os.path.splitext(fname)[0],
+            "label": data.get("label"),
+            "timestamp": data.get("timestamp"),
+            "strategies": data.get("strategies") or {},
+            "aggregate": data.get("aggregate") or {},
+            "question_count": len(data.get("per_question") or []),
+            "runtime_s": data.get("runtime_s"),
+            "dataset_file": data.get("dataset_file"),
+            "chunk_count": data.get("chunk_count"),
+            "testset_hash": data.get("testset_hash"),
+        })
+
+    summaries.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
+    return summaries
+
+
+def load_run(run_id: str, runs_dir: str = EVAL_RUNS_DIR) -> Optional[Dict]:
+    """Load a single saved run by id. Returns None if not found."""
+    if not run_id:
+        return None
+    safe_id = os.path.basename(run_id)
+    path = os.path.join(runs_dir, f"{safe_id}.json")
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as f:

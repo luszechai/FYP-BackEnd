@@ -94,6 +94,89 @@ Most settings can be adjusted in `config.py`. Key settings:
 - `LLM_MAX_TOKENS`: Maximum response length (default: 1000)
 - `CHUNK_SIZE`: Document chunk size for vector DB (default: 1600)
 
+## RAG Evaluation Dashboard
+
+The backend exposes a per-run evaluation API that powers the frontend
+Evaluation Dashboard (accessible via the flask-icon button in the header of
+the chat UI). It runs Ragas (Faithfulness, Answer Relevancy, Context
+Precision, Context Recall) against `eval_testset.json` using the currently
+loaded ChromaDB index. Each click in the dashboard produces two saved runs —
+an **all-off Baseline** and a user-selected **Optimized** run — so the panel
+can be compared side-by-side.
+
+### Endpoints
+
+| Method | Path                          | Description                                                                                     |
+| ------ | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| GET    | `/api/ragas/testset`          | Testset metadata (total questions, category breakdown, sample questions).                       |
+| POST   | `/api/ragas/run`              | Run one evaluation with explicit strategy toggles. Blocks until complete, returns full run doc. |
+| POST   | `/api/ragas/run/stream`       | SSE variant of `/api/ragas/run` — streams per-question progress then a final `run_saved` event. |
+| GET    | `/api/ragas/runs`             | List summaries of every saved run, newest first (no per-question detail).                       |
+| GET    | `/api/ragas/runs/{run_id}`    | Full saved run (strategies + aggregate + per-question retrieval, answer, and metric scores).    |
+
+Legacy endpoints (`/api/ragas/evaluate`, `/api/ragas/results`) remain in
+place for backward compatibility with `run_ragas_evaluation.py`.
+
+### Request body for `/api/ragas/run{,/stream}`
+
+```json
+{
+  "label": "my_optional_run_label",
+  "max_questions": 10,
+  "testset_path": "eval_testset.json",
+  "strategies": {
+    "use_reranker": true,
+    "use_adaptive": true,
+    "use_dedup": true,
+    "use_person_boost": true,
+    "use_hybrid": true,
+    "use_compression": false
+  }
+}
+```
+
+Each strategy is query-time only, so toggling them does **not** require
+re-ingesting ChromaDB. The `/api/chat` singleton is unaffected — evaluation
+runs build a transient `RAGChatbot` that shares the already-loaded
+ChromaDB, LLM provider, and (if enabled) reranker.
+
+### Run storage format
+
+Runs are persisted as JSON under [`eval_runs/`](./eval_runs/README.md) —
+see that README for the full schema. Key fields each run captures:
+
+- `strategies` — the exact toggle combination used.
+- `aggregate` — dataset-level Ragas averages (the 4 scorecard numbers).
+- `per_question` — per-question retrieved chunks, generated answer, latency,
+  and per-metric Ragas scores (powers the Deep Dive modal).
+- `dataset_file`, `dataset_mtime`, `chunk_count`, `testset_hash` —
+  reproducibility metadata so two runs taken at different times / different
+  datasets can be compared unambiguously.
+
+A seeded example (`eval_runs/20260101T000000_baseline_all_off.json`) ships
+with the repo so the dashboard is non-empty on first open; it is safe to
+delete.
+
+### Chunking / dataset A/B workflow
+
+Chunking decisions happen in `src/vector_db.py` and `merged_rag_data.json`,
+not in the dashboard. To compare two chunking or dataset variants:
+
+1. Set `merged_rag_data.json` (or the chunking knobs in
+   `ChromaDBManager.create_collection`) to variant **A**.
+2. `python ingest_documents.py`.
+3. Open the dashboard → Execute A/B with a label like `legacy_chunking_v1`.
+4. Set the data / chunking to variant **B**.
+5. `python ingest_documents.py`.
+6. Open the dashboard → Execute A/B with a label like `recursive_chunking_v2`.
+7. Use the run-picker dropdowns on the two comparison panels to load both
+   labeled runs side-by-side.
+
+If you swapped **content** (not just chunking), also run
+`python generate_testset.py` after step 5 so the two runs score against a
+valid testset. The Deep Dive table shows a warning banner when the two
+selected runs have different `testset_hash` values.
+
 ## Security Notes
 
 - **Never commit API keys or `.env` files to Git**

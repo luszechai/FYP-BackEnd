@@ -35,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 from datetime import datetime, timedelta
 import uuid
 import tempfile
@@ -52,6 +52,12 @@ from src.ragas_evaluation import (
     format_results_summary,
     save_results,
     load_results,
+    build_run_id,
+    compute_testset_hash,
+    list_runs,
+    load_run,
+    save_run,
+    EVAL_RUNS_DIR,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.room_booking import RBSClient
@@ -145,6 +151,27 @@ class StatsResponse(BaseModel):
 class HistoryResponse(BaseModel):
     history: List[Dict]
     count: int
+
+
+class EvalStrategies(BaseModel):
+    """Query-time strategy toggles for an evaluation run.
+
+    Defaults mirror the evaluation "baseline" (everything off) so a plain
+    POST with no body produces a reproducible legacy run.
+    """
+    use_reranker: bool = False
+    use_adaptive: bool = False
+    use_dedup: bool = False
+    use_person_boost: bool = False
+    use_hybrid: bool = False
+    use_compression: bool = False
+
+
+class EvalRunRequest(BaseModel):
+    label: Optional[str] = None
+    max_questions: Optional[int] = None
+    testset_path: str = "eval_testset.json"
+    strategies: EvalStrategies = EvalStrategies()
 
 
 @app.on_event("startup")
@@ -1928,6 +1955,244 @@ async def ragas_testset(testset_path: str = "eval_testset.json"):
         "sample_questions": sample_questions,
         "testset_path": testset_path,
     }
+
+
+# ---- Evaluation Dashboard: per-run endpoints --------------------------------
+
+
+def _build_transient_chatbot(strategies: EvalStrategies) -> "RAGChatbot":
+    """Build a throwaway RAGChatbot configured for a one-off evaluation run.
+
+    Reuses the already-loaded ChromaDB, LLM provider, and (if requested) the
+    existing reranker instance so we don't pay the BGE model-load cost every
+    time. The shared ``/api/chat`` singleton is left untouched.
+    """
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+
+    shared_reranker = None
+    if strategies.use_reranker and getattr(chatbot_instance, "reranker", None) is not None:
+        shared_reranker = chatbot_instance.reranker
+
+    return RAGChatbot(
+        chroma_db=chatbot_instance.db,
+        llm_provider=chatbot_instance.llm,
+        use_adaptive_config=strategies.use_adaptive,
+        use_reranker=strategies.use_reranker,
+        use_dedup=strategies.use_dedup,
+        use_compression=strategies.use_compression,
+        use_hybrid=strategies.use_hybrid,
+        use_person_boost=strategies.use_person_boost,
+        reranker=shared_reranker,
+    )
+
+
+def _execute_eval_run(
+    req: EvalRunRequest,
+    progress_callback: Optional["Callable"] = None,
+) -> Dict:
+    """Run a full evaluation (pipeline + Ragas) and persist the result.
+
+    Returns the saved run dict. Caller is responsible for surfacing errors.
+    """
+    try:
+        testset = load_testset(req.testset_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Testset file not found: {req.testset_path}. Run generate_testset.py first.",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    transient_chatbot = _build_transient_chatbot(req.strategies)
+
+    run_start = time.time()
+    pipeline_results = run_pipeline_on_testset(
+        transient_chatbot,
+        testset,
+        max_questions=req.max_questions,
+        progress_callback=progress_callback,
+    )
+
+    if not pipeline_results:
+        raise HTTPException(status_code=500, detail="No results from pipeline run.")
+
+    if progress_callback:
+        try:
+            progress_callback({"type": "ragas_started", "total": len(pipeline_results)})
+        except Exception:
+            pass
+
+    eval_results = evaluate_with_ragas(pipeline_results)
+    runtime_s = round(time.time() - run_start, 2)
+
+    # Merge per-question Ragas scores with pipeline-level retrieval detail so
+    # the Deep Dive modal has retrieval + generation + metrics in one record.
+    ragas_by_input: Dict[str, Dict] = {}
+    for row in eval_results.get("per_question", []):
+        key = row.get("user_input") or row.get("question") or ""
+        ragas_by_input[key] = row
+
+    combined_rows: List[Dict] = []
+    for pr in pipeline_results:
+        key = pr["user_input"]
+        scores = ragas_by_input.get(key, {})
+        metric_scores = {
+            k: v
+            for k, v in scores.items()
+            if isinstance(v, (int, float)) and k not in ("latency_s",)
+        }
+        combined_rows.append({
+            "user_input": pr["user_input"],
+            "reference": pr.get("reference"),
+            "response": pr.get("response"),
+            "retrieved_contexts": pr.get("retrieved_contexts", []),
+            "retrieved_docs": pr.get("retrieved_docs_raw", []),
+            "latency_s": pr.get("latency_s"),
+            "scores": metric_scores,
+        })
+
+    # Dataset metadata for reproducibility / chunking-A-B labeling
+    dataset_path = Config.DATA_FILE
+    dataset_mtime = None
+    try:
+        if os.path.exists(dataset_path):
+            dataset_mtime = datetime.fromtimestamp(
+                os.path.getmtime(dataset_path)
+            ).isoformat(timespec="seconds")
+    except Exception:
+        pass
+
+    try:
+        chunk_count = chatbot_instance.db.collection.count()
+    except Exception:
+        chunk_count = None
+
+    run_id = build_run_id(req.label)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
+    run_doc = {
+        "id": run_id,
+        "label": req.label or run_id,
+        "timestamp": timestamp,
+        "strategies": req.strategies.dict(),
+        "testset_path": req.testset_path,
+        "testset_hash": compute_testset_hash(testset),
+        "max_questions": req.max_questions,
+        "aggregate": eval_results.get("aggregate", {}),
+        "per_question": combined_rows,
+        "runtime_s": runtime_s,
+        "dataset_file": dataset_path,
+        "dataset_mtime": dataset_mtime,
+        "chunk_count": chunk_count,
+    }
+
+    save_run(run_doc, runs_dir=EVAL_RUNS_DIR)
+
+    if progress_callback:
+        try:
+            progress_callback({"type": "done", "run_id": run_id})
+        except Exception:
+            pass
+
+    return run_doc
+
+
+@app.post("/api/ragas/run")
+async def ragas_run(req: EvalRunRequest):
+    """
+    Run a one-off evaluation with the given strategy toggles and persist it
+    under ``eval_runs/<timestamp>_<label>.json``. Non-streaming: the HTTP
+    response returns once the run (pipeline + Ragas) completes.
+
+    For a live progress feed use ``/api/ragas/run/stream``.
+    """
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+
+    try:
+        loop = asyncio.get_event_loop()
+        run_doc = await loop.run_in_executor(None, lambda: _execute_eval_run(req))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evaluation run error: {str(e)}")
+
+    return run_doc
+
+
+@app.post("/api/ragas/run/stream")
+async def ragas_run_stream(req: EvalRunRequest):
+    """
+    Server-Sent Events variant of ``/api/ragas/run``.
+
+    Emits progress events as the pipeline processes each question and a
+    final ``event: done`` with the saved run summary. The full run body is
+    also persisted and retrievable via ``/api/ragas/runs/{id}``.
+    """
+    if chatbot_instance is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _on_progress(event: Dict):
+        try:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, event)
+        except Exception:
+            pass
+
+    async def _run_and_signal():
+        try:
+            run_doc = await loop.run_in_executor(
+                None, lambda: _execute_eval_run(req, progress_callback=_on_progress)
+            )
+            await progress_queue.put({
+                "type": "run_saved",
+                "run_id": run_doc["id"],
+                "aggregate": run_doc.get("aggregate", {}),
+                "runtime_s": run_doc.get("runtime_s"),
+            })
+        except HTTPException as he:
+            await progress_queue.put({"type": "error", "status": he.status_code, "detail": he.detail})
+        except Exception as e:
+            await progress_queue.put({"type": "error", "detail": str(e)})
+        finally:
+            await progress_queue.put({"type": "__stream_end__"})
+
+    async def event_stream():
+        task = asyncio.create_task(_run_and_signal())
+        try:
+            while True:
+                event = await progress_queue.get()
+                if event.get("type") == "__stream_end__":
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/ragas/runs")
+async def ragas_runs_list():
+    """Return summaries for every persisted evaluation run, newest first."""
+    return {"runs": list_runs(EVAL_RUNS_DIR)}
+
+
+@app.get("/api/ragas/runs/{run_id}")
+async def ragas_runs_detail(run_id: str):
+    """Return full detail (strategies, aggregate, per-question) for one run."""
+    run = load_run(run_id, EVAL_RUNS_DIR)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    return run
 
 
 if __name__ == "__main__":

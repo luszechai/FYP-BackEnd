@@ -4,18 +4,26 @@ from src.vector_db import ChromaDBManager
 from src.bm25_search import BM25Search, reciprocal_rank_fusion
 from src.utils import is_scholarship_query, detect_email_category
 
-# Use only BM25 for retrieval; all other strategies (vector, expanded queries, keyword boosting) are disabled.
-BM25_ONLY = True
-
 
 class HybridRetriever:
-    """Handles hybrid retrieval strategies for document search"""
+    """Handles hybrid retrieval strategies for document search.
+
+    The non-BM25 strategies (vector similarity, expanded-query variants,
+    keyword boosting) are gated behind ``use_hybrid`` so the evaluation
+    dashboard can toggle them on/off per run without mutating globals.
+    ``use_person_boost`` further gates the person-query expansion strategy,
+    which is only meaningful when ``use_hybrid`` is enabled.
+    """
 
     def __init__(self, chroma_db: ChromaDBManager, retrieval_k: int = 5,
-                 bm25: Optional[BM25Search] = None):
+                 bm25: Optional[BM25Search] = None,
+                 use_hybrid: bool = False,
+                 use_person_boost: bool = False):
         self.db = chroma_db
         self.retrieval_k = retrieval_k
         self.bm25 = bm25
+        self.use_hybrid = use_hybrid
+        self.use_person_boost = use_person_boost
 
     def hybrid_retrieval(self, enhanced_query: Dict, use_memory: bool = True,
                          reranker_mode: bool = False) -> List[Dict]:
@@ -29,7 +37,7 @@ class HybridRetriever:
         # Adjust retrieval size for scholarship queries
         base_n_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
 
-        if not BM25_ONLY:
+        if self.use_hybrid:
             print(f"🔍 Strategy 1: Original query (k={base_n_results})")
             results = self.db.query(query_text=enhanced_query['original'], n_results=base_n_results)
             for doc in self.db.format_results(results):
@@ -45,7 +53,7 @@ class HybridRetriever:
         
         # Strategy 1.6: Scholarship-specific queries (enhanced for listing queries)
         is_scholarship_enhanced = is_scholarship or enhanced_query.get('is_scholarship_query', False)
-        if not BM25_ONLY and is_scholarship_enhanced:
+        if self.use_hybrid and is_scholarship_enhanced:
             print(f"🔍 Strategy 1.6: Scholarship queries (listing + deadline)")
             
             # Check if this is a listing query (asking for available scholarships)
@@ -103,7 +111,7 @@ class HybridRetriever:
                     boost = min(0.15, keyword_matches * 0.04)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
-        if not BM25_ONLY and enhanced_query['is_person_query'] and len(enhanced_query['expanded_queries']) > 1:
+        if self.use_hybrid and self.use_person_boost and enhanced_query.get('is_person_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
             print(f"🔍 Strategy 2: Expanded person queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:3]:
@@ -120,7 +128,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.3: Expanded Role Queries (for queries like "who is the programme leader of AI")
-        if not BM25_ONLY and enhanced_query.get('is_role_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if self.use_hybrid and enhanced_query.get('is_role_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
             print(f"🔍 Strategy 2.3: Expanded role queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:5]:
@@ -137,7 +145,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.5: Expanded Program Queries
-        if not BM25_ONLY and enhanced_query.get('is_program_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if self.use_hybrid and enhanced_query.get('is_program_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
             print(f"🔍 Strategy 2.5: Expanded Program queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:4]:
@@ -154,7 +162,7 @@ class HybridRetriever:
                         )
 
         # Strategy 2.6: Expanded Scholarship Queries
-        if not BM25_ONLY and enhanced_query.get('is_scholarship_query', False) and len(enhanced_query['expanded_queries']) > 1:
+        if self.use_hybrid and enhanced_query.get('is_scholarship_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
             print(f"🔍 Strategy 2.6: Expanded Scholarship queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:6]:
@@ -171,7 +179,7 @@ class HybridRetriever:
                         )
 
         # Strategy 3: Keyword matching with context boosting
-        if not BM25_ONLY and enhanced_query['keywords']:
+        if self.use_hybrid and enhanced_query.get('keywords'):
             print(f"🔍 Strategy 3: Keyword matching")
             for doc_id, doc in all_results.items():
                 content_lower = doc['document'].lower()
@@ -195,7 +203,7 @@ class HybridRetriever:
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
         # Strategy 3.5: Role-specific keyword boosting
-        if not BM25_ONLY and enhanced_query.get('is_role_query', False):
+        if self.use_hybrid and enhanced_query.get('is_role_query', False):
             print(f"🔍 Strategy 3.5: Role-specific keyword boosting")
             role_keywords = ['programme leader', 'program leader', 'director', 'head of', 
                            'role', 'coordinator', 'dean', 'chair']
@@ -207,7 +215,7 @@ class HybridRetriever:
                     boost = min(0.15, role_matches * 0.05)
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
-        # ── BM25 keyword search (+ optional RRF fusion with vector when not BM25_ONLY) ──
+        # ── BM25 keyword search (+ optional RRF fusion with vector when use_hybrid) ──
         if self.bm25 is not None and self.bm25.is_available:
             bm25_k = base_n_results
             raw_query = enhanced_query['original']
@@ -218,7 +226,7 @@ class HybridRetriever:
             print(f"🔍 Strategy BM25: Keyword search (k={bm25_k})")
             bm25_results = self.bm25.search(raw_query, k=bm25_k)
 
-            if BM25_ONLY:
+            if not self.use_hybrid:
                 # Use only BM25 ranking; no fusion with vector or other strategies
                 for doc in bm25_results:
                     doc['retrieval_score'] = doc.get('bm25_score', 1.0 / (doc.get('rank', 1) + 1))
@@ -278,7 +286,7 @@ class HybridRetriever:
                 fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
                 all_results = {doc['id']: doc for doc in fused}
         else:
-            if BM25_ONLY:
+            if not self.use_hybrid:
                 # BM25-only mode but BM25 not available; keep all_results empty (no fallback)
                 pass
             else:

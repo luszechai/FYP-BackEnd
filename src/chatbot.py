@@ -20,14 +20,33 @@ from src.context_compressor import compress_context
 class RAGChatbot:
     """RAG-based chatbot with performance tracking"""
 
-    def __init__(self, chroma_db: ChromaDBManager, llm_provider: LLMProvider, 
-                 use_adaptive_config: bool = True, use_reranker: bool = True):
+    def __init__(self, chroma_db: ChromaDBManager, llm_provider: LLMProvider,
+                 use_adaptive_config: bool = True, use_reranker: bool = True,
+                 use_dedup: bool = True, use_compression: bool = True,
+                 use_hybrid: bool = False, use_person_boost: bool = False,
+                 reranker: Optional["Reranker"] = None):
+        """Initialise a RAG chatbot.
+
+        The strategy flags (use_adaptive_config, use_reranker, use_dedup,
+        use_compression, use_hybrid, use_person_boost) can be toggled per
+        instance so the evaluation dashboard can build transient chatbots
+        for one-click A/B runs without mutating the shared ``/api/chat``
+        singleton.
+
+        ``reranker`` may be passed in so evaluation runs reuse an already
+        loaded cross-encoder instead of paying the ~1 GB model-load cost
+        every time. When ``use_reranker`` is False the reranker is ignored.
+        """
         self.db = chroma_db
         self.llm = llm_provider
         self.memory = ConversationMemory(max_history=10)
         self.query_enhancer = QueryEnhancer()
         self.use_adaptive_config = use_adaptive_config
-        
+        self.use_dedup = use_dedup
+        self.use_compression = use_compression
+        self.use_hybrid = use_hybrid
+        self.use_person_boost = use_person_boost
+
         # Build BM25 sparse keyword index for hybrid search
         self.bm25 = BM25Search()
         self.bm25.build_index(chroma_db.collection)
@@ -35,14 +54,21 @@ class RAGChatbot:
         # Base retrieval_k (will be adjusted adaptively if enabled)
         base_retrieval_k = AdaptiveConfig.BASE_RETRIEVAL_K if use_adaptive_config else 5
         self.retriever = HybridRetriever(
-            chroma_db=chroma_db, retrieval_k=base_retrieval_k, bm25=self.bm25
+            chroma_db=chroma_db,
+            retrieval_k=base_retrieval_k,
+            bm25=self.bm25,
+            use_hybrid=use_hybrid,
+            use_person_boost=use_person_boost,
         )
         self.retrieval_k = base_retrieval_k
 
         # Initialize reranker (cross-encoder for more precise relevance scoring)
         self.use_reranker = use_reranker
         if use_reranker:
-            self.reranker = Reranker(model_name="BAAI/bge-reranker-base", use_fp16=True)
+            if reranker is not None:
+                self.reranker = reranker
+            else:
+                self.reranker = Reranker(model_name="BAAI/bge-reranker-base", use_fp16=True)
             if not self.reranker.is_available:
                 print("⚠️ Reranker failed to load — falling back to bi-encoder scoring only")
                 self.use_reranker = False
@@ -218,7 +244,7 @@ class RAGChatbot:
             k = self.retrieval_k * 2 if is_deadline else self.retrieval_k
 
         # Deduplicate retrieved documents before reranking (keep highest scoring copy)
-        if retrieved_docs:
+        if self.use_dedup and retrieved_docs:
             seen = {}
             for doc in retrieved_docs:
                 doc_id = doc['id']
@@ -230,8 +256,9 @@ class RAGChatbot:
         # Use the original user query when available so relevance is judged against
         # what the user actually asked (e.g. "where can I find Wallace" vs rewritten
         # "Wallace Hall location"), avoiding incorrect drops of person/location chunks.
-        compress_query = enhanced_query.get('original_raw', enhanced_query.get('rewritten', query))
-        retrieved_docs = compress_context(self.llm, compress_query, retrieved_docs, max_documents=15)
+        if self.use_compression and retrieved_docs:
+            compress_query = enhanced_query.get('original_raw', enhanced_query.get('rewritten', query))
+            retrieved_docs = compress_context(self.llm, compress_query, retrieved_docs, max_documents=15)
 
         # Rerank candidates with cross-encoder for more precise relevance scoring
         RERANKER_TOP_K = 5  # Always keep the top 5 documents after reranking

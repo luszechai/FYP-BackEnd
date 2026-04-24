@@ -42,6 +42,11 @@ chroma_db/
 *.json
 !merged_rag_data.json
 
+# Keep the seeded baseline_all_off run so the dashboard is non-empty on first
+# open. Locally-generated runs still match the *.json pattern above and stay
+# out of git.
+!eval_runs/20260101T000000_baseline_all_off.json
+
 # Evaluation outputs
 rag_evaluation_*.png
 
