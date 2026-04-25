@@ -162,15 +162,16 @@ class EvalStrategies(BaseModel):
     use_reranker: bool = False
     use_adaptive: bool = False
     use_dedup: bool = False
+    use_bm25: bool = False
     use_person_boost: bool = False
     use_hybrid: bool = False
-    use_compression: bool = False
 
 
 class EvalRunRequest(BaseModel):
     label: Optional[str] = None
     max_questions: Optional[int] = None
     testset_path: str = "eval_testset.json"
+    provider: Optional[str] = None
     strategies: EvalStrategies = EvalStrategies()
 
 
@@ -1960,7 +1961,7 @@ async def ragas_testset(testset_path: str = "eval_testset.json"):
 # ---- Evaluation Dashboard: per-run endpoints --------------------------------
 
 
-def _build_transient_chatbot(strategies: EvalStrategies) -> "RAGChatbot":
+def _build_transient_chatbot(strategies: EvalStrategies, provider: Optional[str] = None) -> "RAGChatbot":
     """Build a throwaway RAGChatbot configured for a one-off evaluation run.
 
     Reuses the already-loaded ChromaDB, LLM provider, and (if requested) the
@@ -1970,17 +1971,19 @@ def _build_transient_chatbot(strategies: EvalStrategies) -> "RAGChatbot":
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
 
+    selected_llm = _get_llm(provider)
+
     shared_reranker = None
     if strategies.use_reranker and getattr(chatbot_instance, "reranker", None) is not None:
         shared_reranker = chatbot_instance.reranker
 
     return RAGChatbot(
         chroma_db=chatbot_instance.db,
-        llm_provider=chatbot_instance.llm,
+        llm_provider=selected_llm,
         use_adaptive_config=strategies.use_adaptive,
         use_reranker=strategies.use_reranker,
         use_dedup=strategies.use_dedup,
-        use_compression=strategies.use_compression,
+        use_bm25=strategies.use_bm25,
         use_hybrid=strategies.use_hybrid,
         use_person_boost=strategies.use_person_boost,
         reranker=shared_reranker,
@@ -2005,7 +2008,7 @@ def _execute_eval_run(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    transient_chatbot = _build_transient_chatbot(req.strategies)
+    transient_chatbot = _build_transient_chatbot(req.strategies, req.provider)
 
     run_start = time.time()
     pipeline_results = run_pipeline_on_testset(
@@ -2076,6 +2079,8 @@ def _execute_eval_run(
         "id": run_id,
         "label": req.label or run_id,
         "timestamp": timestamp,
+        "llm_provider": transient_chatbot.llm.provider,
+        "llm_model": transient_chatbot.llm.model_name,
         "strategies": req.strategies.dict(),
         "testset_path": req.testset_path,
         "testset_hash": compute_testset_hash(testset),

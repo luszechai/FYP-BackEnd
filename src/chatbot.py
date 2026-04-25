@@ -14,7 +14,6 @@ from src.prompts import build_system_message, build_user_prompt
 from src.utils import get_current_datetime_info, is_deadline_query, should_skip_retrieval
 from src.adaptive_config import AdaptiveConfig
 from src.query_rewriter import rewrite_query
-from src.context_compressor import compress_context
 
 
 class RAGChatbot:
@@ -22,16 +21,16 @@ class RAGChatbot:
 
     def __init__(self, chroma_db: ChromaDBManager, llm_provider: LLMProvider,
                  use_adaptive_config: bool = True, use_reranker: bool = True,
-                 use_dedup: bool = True, use_compression: bool = True,
-                 use_hybrid: bool = False, use_person_boost: bool = False,
+                 use_dedup: bool = True, use_bm25: bool = True,
+                 use_hybrid: bool = False,
+                 use_person_boost: bool = False,
                  reranker: Optional["Reranker"] = None):
         """Initialise a RAG chatbot.
 
         The strategy flags (use_adaptive_config, use_reranker, use_dedup,
-        use_compression, use_hybrid, use_person_boost) can be toggled per
-        instance so the evaluation dashboard can build transient chatbots
-        for one-click A/B runs without mutating the shared ``/api/chat``
-        singleton.
+        use_bm25, use_hybrid, use_person_boost) can be toggled per instance so
+        the evaluation dashboard can build transient chatbots for one-click
+        A/B runs without mutating the shared ``/api/chat`` singleton.
 
         ``reranker`` may be passed in so evaluation runs reuse an already
         loaded cross-encoder instead of paying the ~1 GB model-load cost
@@ -43,7 +42,7 @@ class RAGChatbot:
         self.query_enhancer = QueryEnhancer()
         self.use_adaptive_config = use_adaptive_config
         self.use_dedup = use_dedup
-        self.use_compression = use_compression
+        self.use_bm25 = use_bm25
         self.use_hybrid = use_hybrid
         self.use_person_boost = use_person_boost
 
@@ -57,6 +56,7 @@ class RAGChatbot:
             chroma_db=chroma_db,
             retrieval_k=base_retrieval_k,
             bm25=self.bm25,
+            use_bm25=use_bm25,
             use_hybrid=use_hybrid,
             use_person_boost=use_person_boost,
         )
@@ -251,14 +251,6 @@ class RAGChatbot:
                 if doc_id not in seen or doc.get('retrieval_score', 0) > seen[doc_id].get('retrieval_score', 0):
                     seen[doc_id] = doc
             retrieved_docs = list(seen.values())
-
-        # Drop irrelevant chunks (and compress) before reranking.
-        # Use the original user query when available so relevance is judged against
-        # what the user actually asked (e.g. "where can I find Wallace" vs rewritten
-        # "Wallace Hall location"), avoiding incorrect drops of person/location chunks.
-        if self.use_compression and retrieved_docs:
-            compress_query = enhanced_query.get('original_raw', enhanced_query.get('rewritten', query))
-            retrieved_docs = compress_context(self.llm, compress_query, retrieved_docs, max_documents=15)
 
         # Rerank candidates with cross-encoder for more precise relevance scoring
         RERANKER_TOP_K = 5  # Always keep the top 5 documents after reranking

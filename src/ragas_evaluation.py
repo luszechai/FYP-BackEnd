@@ -482,6 +482,8 @@ def list_runs(runs_dir: str = EVAL_RUNS_DIR) -> List[Dict]:
             "id": data.get("id") or os.path.splitext(fname)[0],
             "label": data.get("label"),
             "timestamp": data.get("timestamp"),
+            "llm_provider": data.get("llm_provider"),
+            "llm_model": data.get("llm_model"),
             "strategies": data.get("strategies") or {},
             "aggregate": data.get("aggregate") or {},
             "question_count": len(data.get("per_question") or []),
