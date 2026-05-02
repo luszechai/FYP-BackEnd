@@ -259,7 +259,7 @@ class RAGChatbot:
             retrieved_docs = list(seen.values())
 
         # Rerank candidates with cross-encoder for more precise relevance scoring
-        RERANKER_TOP_K = 5  # Always keep the top 5 documents after reranking
+        RERANKER_TOP_K = 10  # Keep the top 10 documents after reranking
         if self.use_reranker and retrieved_docs:
             # Use the raw query (without memory prepended) for reranking
             retrieved_docs = self.reranker.rerank(query, retrieved_docs, top_k=RERANKER_TOP_K)

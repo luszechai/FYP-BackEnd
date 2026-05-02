@@ -1716,6 +1716,54 @@ async def get_emails():
                 deduped.append(value)
         return deduped or ["other"]
 
+    def _clean_email_field_value(value, expected_keys: Tuple[str, ...]) -> str:
+        if value is None:
+            return ""
+
+        text = str(value).strip()
+        if not text:
+            return ""
+
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    for key in expected_keys:
+                        nested = _clean_email_field_value(parsed.get(key), expected_keys)
+                        if nested:
+                            return nested
+                return ""
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        match = re.match(
+            r'^["\']?(?P<key>[A-Za-z_]+)["\']?\s*:\s*(?P<val>.+?)(?:,)?$',
+            text,
+            re.DOTALL,
+        )
+        if match:
+            key = match.group("key")
+            if key not in expected_keys:
+                return ""
+            text = match.group("val").strip().rstrip(",").strip()
+
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            try:
+                text = json.loads(text)
+            except json.JSONDecodeError:
+                text = text[1:-1]
+
+        text = str(text).strip()
+        if not text or text.startswith(("{", "[")):
+            return ""
+        if "\\n" in text or "\n" in text or len(text) > 500:
+            return ""
+        return text
+
+    def _extract_email_header_value(content: str, label: str, expected_keys: Tuple[str, ...]) -> str:
+        match = re.search(rf"^{re.escape(label)}:\s*(.+)$", content, re.MULTILINE)
+        return _clean_email_field_value(match.group(1), expected_keys) if match else ""
+
     for i, meta in enumerate(metadatas):
         source = meta.get("source", "")
         group_key = meta.get("email_id", "") or source
@@ -1761,6 +1809,40 @@ async def get_emails():
         ] if eid else []
 
         has_html = meta.get("email_has_html", "false") == "true"
+        application_period = (
+            _clean_email_field_value(
+                meta.get("email_application_period", ""),
+                ("application_period", "period"),
+            )
+            or _extract_email_header_value(
+                full_content,
+                "Application Period",
+                ("application_period", "period"),
+            )
+        )
+        event_period = (
+            _clean_email_field_value(
+                meta.get("email_event_period", ""),
+                ("event_period", "period"),
+            )
+            or _extract_email_header_value(
+                full_content,
+                "Event Period",
+                ("event_period", "period"),
+            )
+        )
+        event_time = (
+            _clean_email_field_value(meta.get("email_event_time", ""), ("event_time", "time"))
+            or _extract_email_header_value(full_content, "Event Time", ("event_time", "time"))
+        )
+        period = (
+            _clean_email_field_value(
+                meta.get("email_period", ""),
+                ("application_period", "event_period", "period"),
+            )
+            or application_period
+            or event_period
+        )
 
         seen_sources[source] = {
             "name": meta.get("email_name", ""),
@@ -1769,13 +1851,13 @@ async def get_emails():
             "type": ", ".join(email_types) if len(email_types) > 1 else (email_types[0] if email_types else meta.get("email_type", "")),
             "types": email_types,
             "introduction": meta.get("email_introduction", ""),
-            "period": meta.get("email_period", ""),
-            "application_period": meta.get("email_application_period", ""),
-            "event_period": meta.get("email_event_period", ""),
+            "period": period,
+            "application_period": application_period,
+            "event_period": event_period,
             "details": meta.get("email_details", ""),
             "fees": meta.get("email_fees", ""),
             "time": meta.get("email_time", ""),
-            "event_time": meta.get("email_event_time", ""),
+            "event_time": event_time,
             "requirements": meta.get("email_requirements", ""),
             "links": meta.get("email_links", ""),
             "content": full_content,

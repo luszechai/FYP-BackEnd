@@ -1,4 +1,6 @@
 """Retrieval strategies for document search"""
+import re
+from datetime import date, datetime
 from typing import List, Dict, Optional
 from src.vector_db import ChromaDBManager
 from src.bm25_search import BM25Search, reciprocal_rank_fusion
@@ -234,50 +236,7 @@ class HybridRetriever:
                 for doc in bm25_results:
                     doc['retrieval_score'] = doc.get('bm25_score', 1.0 / (doc.get('rank', 1) + 1))
                 all_results = {doc['id']: doc for doc in bm25_results}
-
-                # Boost: inject email documents when query matches an email category
-                email_cat = detect_email_category(raw_query)
-                if email_cat:
-                    where_filter = {"$and": [
-                        {"type": {"$eq": "email"}},
-                        {"email_type": {"$eq": email_cat}},
-                    ]}
-                    try:
-                        email_results = self.db.collection.get(
-                            where=where_filter,
-                            include=["documents", "metadatas"],
-                        )
-                    except Exception:
-                        email_results = {"ids": [], "documents": [], "metadatas": []}
-
-                    email_ids = email_results.get("ids", [])
-                    email_docs = email_results.get("documents", [])
-                    email_metas = email_results.get("metadatas", [])
-
-                    if email_ids:
-                        top_bm25 = max(
-                            (d.get("retrieval_score", 0) for d in all_results.values()),
-                            default=1.0,
-                        )
-                        inject_score = max(top_bm25, 1.0)
-                        injected = 0
-                        for idx, eid in enumerate(email_ids):
-                            if eid not in all_results:
-                                all_results[eid] = {
-                                    "id": eid,
-                                    "document": email_docs[idx] if idx < len(email_docs) else "",
-                                    "metadata": email_metas[idx] if idx < len(email_metas) else {},
-                                    "retrieval_score": inject_score,
-                                    "rank": 0,
-                                    "similarity": 0.0,
-                                }
-                                injected += 1
-                            else:
-                                all_results[eid]["retrieval_score"] = max(
-                                    all_results[eid]["retrieval_score"], inject_score
-                                )
-                        if injected:
-                            print(f"📧 Injected {injected} email doc(s) for category '{email_cat}'")
+                self._inject_email_aggregates(all_results, raw_query)
             else:
                 # Build a vector ranking list (sorted by current retrieval_score)
                 vector_ranking = sorted(
@@ -288,6 +247,7 @@ class HybridRetriever:
                 # Fuse vector + BM25 rankings with RRF
                 fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
                 all_results = {doc['id']: doc for doc in fused}
+                self._inject_email_aggregates(all_results, raw_query)
         elif self.use_hybrid:
             # Assign retrieval_score for documents that may only have similarity.
             for doc in all_results.values():
@@ -326,6 +286,241 @@ class HybridRetriever:
                 seen_content.append(snippet)
 
         return final
+
+    def _inject_email_aggregates(self, all_results: Dict[str, Dict], raw_query: str) -> None:
+        """Inject one aggregate doc per matching email category, not one per chunk."""
+        email_cat = detect_email_category(raw_query)
+        if not email_cat:
+            return
+
+        where_filter = {"$and": [
+            {"type": {"$eq": "email"}},
+            {"email_type": {"$eq": email_cat}},
+        ]}
+        try:
+            email_results = self.db.collection.get(
+                where=where_filter,
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            email_results = {"ids": [], "documents": [], "metadatas": []}
+
+        email_ids = email_results.get("ids", [])
+        if not email_ids:
+            return
+
+        email_groups = self._group_email_chunks(
+            email_ids,
+            email_results.get("documents", []),
+            email_results.get("metadatas", []),
+        )
+        today = date.today()
+        top_score = max(
+            (d.get("retrieval_score", 0) for d in all_results.values()),
+            default=1.0,
+        )
+        inject_score = max(top_score, 1.0)
+        injected = 0
+        skipped_expired = 0
+
+        for email_key, group in email_groups.items():
+            doc_text = "\n\n".join(
+                chunk["document"] for chunk in group["chunks"] if chunk["document"]
+            )
+            metadata = dict(group["metadata"])
+            metadata["parent_doc_id"] = email_key
+            self._remove_email_chunks(all_results, email_key)
+
+            if self._is_expired_email(metadata, doc_text, today):
+                skipped_expired += 1
+                continue
+
+            result_id = f"email:{email_key}"
+            if result_id not in all_results:
+                all_results[result_id] = {
+                    "id": result_id,
+                    "document": doc_text,
+                    "metadata": metadata,
+                    "retrieval_score": inject_score,
+                    "rank": 0,
+                    "similarity": 0.0,
+                }
+                injected += 1
+            else:
+                all_results[result_id]["retrieval_score"] = max(
+                    all_results[result_id]["retrieval_score"], inject_score
+                )
+
+        if injected:
+            msg = f"📧 Injected {injected} email(s) for category '{email_cat}'"
+            if skipped_expired:
+                msg += f" (skipped {skipped_expired} expired email(s))"
+            print(msg)
+        elif skipped_expired:
+            print(
+                f"📧 Skipped {skipped_expired} expired email(s) "
+                f"for category '{email_cat}'"
+            )
+
+    @classmethod
+    def _group_email_chunks(
+        cls,
+        ids: List[str],
+        documents: List[str],
+        metadatas: List[Dict],
+    ) -> Dict[str, Dict]:
+        """Group Chroma email chunks back into one logical email."""
+        groups: Dict[str, Dict] = {}
+        for idx, chunk_id in enumerate(ids):
+            metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
+            email_key = cls._email_group_key(metadata, chunk_id)
+            group = groups.setdefault(email_key, {"metadata": metadata, "chunks": []})
+            if len(str(metadata)) > len(str(group["metadata"])):
+                group["metadata"] = metadata
+            group["chunks"].append({
+                "id": chunk_id,
+                "document": documents[idx] if idx < len(documents) else "",
+                "index": metadata.get("chunk_index", idx),
+            })
+
+        for group in groups.values():
+            group["chunks"].sort(key=lambda chunk: chunk["index"])
+        return groups
+
+    @staticmethod
+    def _email_group_key(metadata: Dict, fallback_id: str) -> str:
+        return (
+            str(metadata.get("email_id") or "").strip()
+            or str(metadata.get("source") or "").strip()
+            or str(metadata.get("parent_doc_id") or "").strip()
+            or fallback_id
+        )
+
+    @classmethod
+    def _remove_email_chunks(cls, all_results: Dict[str, Dict], email_key: str) -> None:
+        """Drop existing chunk-level hits for the same email before injecting aggregate."""
+        for doc_id, doc in list(all_results.items()):
+            metadata = doc.get("metadata", {}) or {}
+            if cls._email_group_key(metadata, doc_id) == email_key:
+                del all_results[doc_id]
+
+    @classmethod
+    def _is_expired_email(cls, metadata: Dict, document: str, today: date) -> bool:
+        """Return True when an injected email is no longer actionable."""
+        application_text = " ".join(
+            str(metadata.get(key, "") or "")
+            for key in ("email_application_period", "email_period")
+        )
+        application_dates = cls._extract_dates(application_text)
+        if application_dates:
+            return max(application_dates) < today
+
+        event_text = " ".join(
+            str(metadata.get(key, "") or "")
+            for key in ("email_event_time", "email_time", "email_event_period")
+        )
+        event_dates = cls._extract_dates(event_text)
+        if event_dates:
+            return max(event_dates) < today
+
+        # Metadata did not carry dates in older rows; inspect only structured headers.
+        header_text = "\n".join(
+            line for line in (document or "").splitlines()
+            if line.startswith(("Application Period:", "Event Period:", "Event Time:"))
+        )
+        header_dates = cls._extract_dates(header_text)
+        return bool(header_dates and max(header_dates) < today)
+
+    @staticmethod
+    def _extract_dates(text: str) -> List[date]:
+        """Extract common email date formats; unknown/no-year dates use current year."""
+        if not text:
+            return []
+
+        month_names = {
+            "jan": 1, "january": 1,
+            "feb": 2, "february": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        current_year = date.today().year
+        dates: List[date] = []
+
+        def add(y: int, m: int, d: int) -> None:
+            try:
+                dates.append(date(y, m, d))
+            except ValueError:
+                pass
+
+        for match in re.finditer(r"\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b", text):
+            add(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+        # HK emails commonly use day/month/year and compact ranges.
+        for match in re.finditer(
+            r"\b(\d{1,2})[/-](\d{1,2})\s*(?:-|–|to)\s*"
+            r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b",
+            text,
+            re.IGNORECASE,
+        ):
+            year = int(match.group(5))
+            add(year, int(match.group(2)), int(match.group(1)))
+            add(year, int(match.group(4)), int(match.group(3)))
+
+        for match in re.finditer(
+            r"\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b",
+            text,
+            re.IGNORECASE,
+        ):
+            year = int(match.group(4))
+            month = int(match.group(3))
+            add(year, month, int(match.group(1)))
+            add(year, month, int(match.group(2)))
+
+        for match in re.finditer(r"\b(?!\d{4}[/-])(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text):
+            add(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+
+        for match in re.finditer(
+            r"\b(\d{1,2})\s+"
+            r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+            r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+            r"\.?,?\s*(\d{4})?\b",
+            text,
+            re.IGNORECASE,
+        ):
+            add(
+                int(match.group(3) or current_year),
+                month_names[match.group(2).lower().rstrip(".")],
+                int(match.group(1)),
+            )
+
+        for match in re.finditer(
+            r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+            r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+            r"\.?\s+(\d{1,2})(?:,\s*(\d{4}))?\b",
+            text,
+            re.IGNORECASE,
+        ):
+            add(
+                int(match.group(3) or current_year),
+                month_names[match.group(1).lower().rstrip(".")],
+                int(match.group(2)),
+            )
+
+        for match in re.finditer(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日號]?", text):
+            add(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+        for match in re.finditer(r"(?<!年)(\d{1,2})\s*月\s*(\d{1,2})\s*[日號]?", text):
+            add(current_year, int(match.group(1)), int(match.group(2)))
+
+        return dates
 
     @staticmethod
     def _text_overlap(a: str, b: str) -> float:

@@ -21,6 +21,7 @@ import imaplib
 import json
 import os
 import re
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header as _decode_header_parts
@@ -31,6 +32,10 @@ from config import Config
 from src.llm_provider import LLMProvider
 from src.vector_db import ChromaDBManager
 from src.document_loader import DocumentLoaderFactory
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 _IMAGE_MIME_MAP = {
@@ -68,8 +73,10 @@ _CLASSIFICATION_SYSTEM_MESSAGE = (
     '2. EXTRACT structured information (leave empty string "" if not found):\n'
     "   - name: The name/title of the scholarship, event, or recruitment\n"
     '   - introduction: Introduction of the scholarship, event, or recruitment(a short summary of the email, or extraction of the main content of the email)\n'
-    '   - application_period: Application period (e.g. "2024-01-01 to 2024-03-31")\n'
-    '   - event_period: Event period (e.g. "2024-01-01 to 2024-03-31")\n'
+    '   - application_period: Application / registration / enrolment period or deadline '
+    '(e.g. "2024-01-01 to 2024-03-31"; if only a deadline exists, copy it exactly)\n'
+    '   - event_period: Event period/date, not the registration period '
+    '(e.g. "2024-01-01 to 2024-03-31")\n'
     "   - details: Brief description of what this is about\n"
     '   - fees: Any fees or costs involved (e.g. "$100", "Free", "")\n'
     "   - event_time: Specific date/time of event or deadline\n"
@@ -504,6 +511,153 @@ def _resolve_email_types(result: Dict, forced_types: List[str]) -> List[str]:
     return normalized
 
 
+_DATEISH_RE = re.compile(
+    r"("
+    r"\d{4}[/-]\d{1,2}[/-]\d{1,2}"
+    r"|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?"
+    r"|\d{1,2}\s*(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|"
+    r"Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\.?\s*,?\s*\d{0,4}"
+    r"|(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|"
+    r"Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\.?\s+\d{1,2}(?:,\s*\d{4})?"
+    r"|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*[日號]?"
+    r"|\d{1,2}\s*月\s*\d{1,2}\s*[日號]?"
+    r")",
+    re.IGNORECASE,
+)
+
+_APPLICATION_PERIOD_KEYWORDS = (
+    "application period",
+    "application deadline",
+    "application due",
+    "application:",
+    "application：",
+    "registration period",
+    "registration deadline",
+    "registration:",
+    "registration：",
+    "enrolment period",
+    "enrolment deadline",
+    "enrolment:",
+    "enrolment：",
+    "enrollment period",
+    "enrollment deadline",
+    "enrollment:",
+    "enrollment：",
+    "apply by",
+    "submission deadline",
+    "deadline",
+    "報名期",
+    "報名期間",
+    "報名截止",
+    "申請期",
+    "申請期間",
+    "申請截止",
+    "截止日期",
+    "截止",
+)
+
+_EVENT_PERIOD_KEYWORDS = (
+    "event period",
+    "event date",
+    "event time",
+    "date and time",
+    "date:",
+    "date：",
+    "activity period",
+    "活動日期",
+    "活動時間",
+    "舉行日期",
+    "日期及時間",
+    "日期：",
+)
+
+
+def _extract_json_string_field(text: str, keys: Tuple[str, ...]) -> str:
+    """Extract a string field from a JSON-ish model response without parsing all JSON."""
+    if not text:
+        return ""
+
+    for key in keys:
+        match = re.search(
+            rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            continue
+        raw_value = match.group(1)
+        try:
+            value = json.loads(f'"{raw_value}"')
+        except json.JSONDecodeError:
+            value = raw_value
+        return str(value).strip()
+    return ""
+
+
+def _clean_period_fragment(fragment: str) -> str:
+    """Remove accidental JSON key wrappers from fallback period snippets."""
+    if fragment is None or isinstance(fragment, (dict, list)):
+        return ""
+
+    cleaned = str(fragment)[:320].strip(" -:;：，。")
+    if not cleaned or cleaned.startswith(("{", "[")):
+        return ""
+
+    match = re.match(
+        r'^["\']?(?P<key>[A-Za-z_]+)["\']?\s*:\s*(?P<value>.+?)(?:,)?$',
+        cleaned,
+        re.DOTALL,
+    )
+    if not match:
+        return cleaned
+
+    key = match.group("key")
+    if key in {"full_text", "details", "introduction", "links", "name"}:
+        return ""
+
+    value = match.group("value").strip().rstrip(",").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = value[1:-1]
+    return str(value).strip(" -:;：，。")[:320]
+
+
+def _extract_period_by_keywords(text: str, keywords: Tuple[str, ...]) -> str:
+    """Best-effort fallback for dates Kimi leaves out of structured JSON."""
+    if not text:
+        return ""
+
+    normalized = re.sub(r"[ \t]+", " ", text.replace("\r", "\n"))
+    fragments: List[str] = []
+    for line in normalized.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fragments.extend(
+            part.strip()
+            for part in re.split(r"(?<=[。；;])\s+| {2,}", line)
+            if part.strip()
+        )
+
+    for index, fragment in enumerate(fragments):
+        lower = fragment.lower()
+        if not any(keyword.lower() in lower for keyword in keywords):
+            continue
+        candidates = [
+            " ".join(fragments[index:index + width])
+            for width in range(1, 4)
+        ]
+        for candidate in candidates:
+            if _DATEISH_RE.search(candidate):
+                cleaned = _clean_period_fragment(candidate)
+                if cleaned:
+                    return cleaned
+
+    return ""
+
+
 def _process_email_with_kimi(
     llm: Optional[LLMProvider],
     subject: str,
@@ -528,6 +682,10 @@ def _process_email_with_kimi(
 
     fallback_links = [{"url": u, "category": "other"} for u in discovered_links]
     forced_types = _detect_forced_email_types(subject, body, attachment_text)
+    fallback_application_period = _extract_period_by_keywords(
+        prompt, _APPLICATION_PERIOD_KEYWORDS,
+    )
+    fallback_event_period = _extract_period_by_keywords(prompt, _EVENT_PERIOD_KEYWORDS)
 
     if llm is None:
         email_type = forced_types[0] if forced_types else ""
@@ -536,8 +694,8 @@ def _process_email_with_kimi(
             "types": forced_types,
             "name": subject,
             "introduction": "",
-            "application_period": "",
-            "event_period": "",
+            "application_period": fallback_application_period,
+            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else fallback_event_period,
             "details": "",
             "fees": "",
             "event_time": "",
@@ -592,8 +750,20 @@ def _process_email_with_kimi(
                 categorized.append({"url": url, "category": "other"})
 
         # Prompt uses application_period, event_period, event_time; support legacy period/time
-        application_period = result.get("application_period", "") or result.get("period", "")
-        event_period = result.get("event_period", "") or result.get("period", "")
+        full_text = result.get("full_text", prompt)
+        application_period = (
+            _clean_period_fragment(result.get("application_period", ""))
+            or _extract_period_by_keywords(full_text, _APPLICATION_PERIOD_KEYWORDS)
+            or fallback_application_period
+            or _clean_period_fragment(result.get("period", ""))
+        )
+        event_period = _clean_period_fragment(result.get("event_period", ""))
+        if not event_period and forced_types != _JOBS_EVENTS_TYPES:
+            event_period = (
+                _extract_period_by_keywords(full_text, _EVENT_PERIOD_KEYWORDS)
+                or fallback_event_period
+                or _clean_period_fragment(result.get("period", ""))
+            )
         event_time = result.get("event_time", "") or result.get("time", "")
         email_types = _resolve_email_types(result, forced_types)
         return {
@@ -608,19 +778,36 @@ def _process_email_with_kimi(
             "event_time": event_time,
             "requirements": result.get("requirements", ""),
             "links": categorized,
-            "full_text": result.get("full_text", prompt),
+            "full_text": full_text,
         }
 
     except json.JSONDecodeError:
         print("⚠️ Kimi did not return valid JSON; using raw response as full_text.")
         email_type = forced_types[0] if forced_types else ""
+        raw_full_text = _extract_json_string_field(raw, ("full_text",)) or raw
         return {
             "type": email_type,
             "types": forced_types,
             "name": subject,
             "introduction": "",
-            "application_period": "",
-            "event_period": "",
+            "application_period": (
+                _clean_period_fragment(
+                    _extract_json_string_field(raw, ("application_period", "period"))
+                )
+                or _extract_period_by_keywords(raw_full_text, _APPLICATION_PERIOD_KEYWORDS)
+                or fallback_application_period
+            ),
+            "event_period": (
+                _clean_period_fragment(_extract_json_string_field(raw, ("event_period",)))
+                or (
+                    ""
+                    if forced_types == _JOBS_EVENTS_TYPES
+                    else (
+                        _extract_period_by_keywords(raw_full_text, _EVENT_PERIOD_KEYWORDS)
+                        or fallback_event_period
+                    )
+                )
+            ),
             "details": "",
             "fees": "",
             "event_time": "",
@@ -636,8 +823,8 @@ def _process_email_with_kimi(
             "types": forced_types,
             "name": subject,
             "introduction": "",
-            "application_period": "",
-            "event_period": "",
+            "application_period": fallback_application_period,
+            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else fallback_event_period,
             "details": "",
             "fees": "",
             "event_time": "",
@@ -792,8 +979,8 @@ def fetch_and_ingest_emails():
                 flat_links_str = "\n".join(
                     lk["url"] if isinstance(lk, dict) else lk for lk in info.get("links", [])
                 )
-                application_period = info.get("application_period", "")
-                event_period = info.get("event_period", "")
+                application_period = _clean_period_fragment(info.get("application_period", ""))
+                event_period = _clean_period_fragment(info.get("event_period", ""))
                 event_time = info.get("event_time", "")
                 period = application_period or event_period
                 all_docs.append({
