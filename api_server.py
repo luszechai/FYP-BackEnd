@@ -62,6 +62,8 @@ from src.ragas_evaluation import (
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.room_booking import RBSClient
 from src.rbs_intent import detect_rbs_intent, extract_rbs_params
+from src.program_catalog import get_programme_code_reference_source
+from src.scholarship_catalog import get_scholarship_reference_source
 from config import Config
 import json
 import re
@@ -365,7 +367,7 @@ def deduplicate_sources(raw_sources: list) -> list:
         unique_key = parent_doc_id if parent_doc_id else (source_url if source_url else source.get('id', ''))
 
         if unique_key and unique_key not in seen_sources:
-            source_id = f"doc_{parent_doc_id}" if parent_doc_id else source.get('id', '')
+            source_id = parent_doc_id if parent_doc_id else source.get('id', '')
             source_name = f"Document {len(seen_sources) + 1} - {section}"
 
             source_data = {
@@ -405,10 +407,22 @@ def filter_cited_sources(response_text: str, sources: list) -> tuple:
     old_to_new = {}
     filtered = []
     for new_num, old_num in enumerate(cited_numbers, start=1):
-        idx = old_num - 1
-        if 0 <= idx < len(sources):
+        source_match = next(
+            (
+                source
+                for source in sources
+                if source.get('metadata', {}).get('context_doc_num') == old_num
+            ),
+            None,
+        )
+        if source_match is None:
+            idx = old_num - 1
+            if 0 <= idx < len(sources):
+                source_match = sources[idx]
+
+        if source_match is not None:
             old_to_new[old_num] = new_num
-            source_copy = dict(sources[idx])
+            source_copy = dict(source_match)
             source_copy['rank'] = new_num
             source_copy['source_name'] = re.sub(
                 r'^Document \d+', f'Document {new_num}',
@@ -1564,7 +1578,15 @@ async def get_source(source_id: str):
     """Get full source document by ID"""
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
-    
+
+    programme_reference_source = get_programme_code_reference_source(source_id)
+    if programme_reference_source:
+        return programme_reference_source
+
+    scholarship_reference_source = get_scholarship_reference_source(source_id)
+    if scholarship_reference_source:
+        return scholarship_reference_source
+
     try:
         # Query the vector database for all chunks of this source
         # Extract parent_doc_id from source_id
@@ -1573,6 +1595,11 @@ async def get_source(source_id: str):
             results = chatbot_instance.db.collection.get(
                 where={"parent_doc_id": source_id}
             )
+
+            if not results['ids'] and source_id.startswith("doc_doc_"):
+                results = chatbot_instance.db.collection.get(
+                    where={"parent_doc_id": source_id.removeprefix("doc_")}
+                )
             
             if not results['ids']:
                 raise HTTPException(status_code=404, detail="Source not found")
@@ -1604,8 +1631,32 @@ async def get_source(source_id: str):
             # Single chunk lookup
             results = chatbot_instance.db.collection.get(ids=[source_id])
             if not results['ids']:
-                raise HTTPException(status_code=404, detail="Source not found")
+                results = chatbot_instance.db.collection.get(
+                    where={"parent_doc_id": source_id}
+                )
+                if not results['ids']:
+                    raise HTTPException(status_code=404, detail="Source not found")
             
+            if len(results['ids']) > 1:
+                chunks = []
+                for i, doc_id in enumerate(results['ids']):
+                    doc_index = results['metadatas'][i].get('chunk_index', 0)
+                    chunks.append({
+                        'index': doc_index,
+                        'content': results['documents'][i],
+                        'metadata': results['metadatas'][i]
+                    })
+                chunks.sort(key=lambda x: x['index'])
+                metadata = chunks[0]['metadata'] if chunks else {}
+                return {
+                    "source_id": source_id,
+                    "section": metadata.get('section', 'Unknown Section'),
+                    "source_file": metadata.get('source', ''),
+                    "content": '\n\n'.join([chunk['content'] for chunk in chunks]),
+                    "metadata": metadata,
+                    "total_chunks": len(chunks)
+                }
+
             return {
                 "source_id": source_id,
                 "section": results['metadatas'][0].get('section', 'Unknown Section'),
@@ -1638,23 +1689,56 @@ async def get_emails():
     metadatas = results.get("metadatas", [])
     documents = results.get("documents", [])
 
+    def _parse_email_types(meta: dict) -> List[str]:
+        if "[Jobs & Events]" in (meta.get("email_subject", "") or ""):
+            return ["Job Recruitment", "events"]
+
+        valid_types = {"scholarship", "events", "Member Recruitment", "Job Recruitment", "workshop"}
+        raw_types = meta.get("email_types", "")
+        parsed: List[str] = []
+        if raw_types:
+            try:
+                loaded = json.loads(raw_types)
+                if isinstance(loaded, list):
+                    parsed.extend(str(item).strip() for item in loaded if str(item).strip())
+            except (json.JSONDecodeError, TypeError):
+                parsed.extend(part.strip() for part in raw_types.split("|") if part.strip())
+
+        email_type = (meta.get("email_type", "") or "").strip()
+        if not parsed and email_type:
+            parsed.append(email_type)
+
+        deduped: List[str] = []
+        for value in parsed:
+            if value not in valid_types:
+                continue
+            if value not in deduped:
+                deduped.append(value)
+        return deduped or ["other"]
+
     for i, meta in enumerate(metadatas):
         source = meta.get("source", "")
-        if not source:
+        group_key = meta.get("email_id", "") or source
+        if not group_key:
             continue
-        if source not in email_chunks:
-            email_chunks[source] = {
+        if group_key not in email_chunks:
+            email_chunks[group_key] = {
                 "meta": meta,
                 "chunks": [],
+                "types": [],
             }
-        email_chunks[source]["chunks"].append({
+        email_chunks[group_key]["chunks"].append({
             "index": meta.get("chunk_index", 0),
             "text": documents[i] if i < len(documents) else "",
         })
+        for email_type in _parse_email_types(meta):
+            if email_type not in email_chunks[group_key]["types"]:
+                email_chunks[group_key]["types"].append(email_type)
 
     seen_sources: dict = {}
     for source, data in email_chunks.items():
         meta = data["meta"]
+        email_types = data.get("types") or _parse_email_types(meta)
         sorted_chunks = sorted(data["chunks"], key=lambda c: c["index"])
         full_content = "\n\n".join(c["text"] for c in sorted_chunks if c["text"])
 
@@ -1682,7 +1766,8 @@ async def get_emails():
             "name": meta.get("email_name", ""),
             "subject": meta.get("email_subject", ""),
             "date": meta.get("email_date", ""),
-            "type": meta.get("email_type", ""),
+            "type": ", ".join(email_types) if len(email_types) > 1 else (email_types[0] if email_types else meta.get("email_type", "")),
+            "types": email_types,
             "introduction": meta.get("email_introduction", ""),
             "period": meta.get("email_period", ""),
             "application_period": meta.get("email_application_period", ""),
@@ -1709,19 +1794,22 @@ async def get_emails():
         "other": [],
     }
     for email_info in seen_sources.values():
-        category = (email_info.get("type") or "").strip()
-        cat_lower = category.lower()
-        if category in ("scholarship", "events"):
-            bucket = category
-        elif category in ("Member Recruitment", "Job Recruitment"):
-            bucket = category
-        elif cat_lower == "workshop":
-            bucket = "workshop"
-        elif category == "recruitment":
-            bucket = "other"
-        else:
-            bucket = "other"
-        grouped[bucket].append(email_info)
+        categories = email_info.get("types") or [email_info.get("type", "")]
+        for category in categories:
+            category = (category or "").strip()
+            cat_lower = category.lower()
+            if category in ("scholarship", "events"):
+                bucket = category
+            elif category in ("Member Recruitment", "Job Recruitment"):
+                bucket = category
+            elif cat_lower == "workshop":
+                bucket = "workshop"
+            elif category == "recruitment":
+                bucket = "other"
+            else:
+                bucket = "other"
+            if email_info not in grouped[bucket]:
+                grouped[bucket].append(email_info)
 
     total = sum(len(v) for v in grouped.values())
     return {"emails": grouped, "total": total}

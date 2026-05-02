@@ -38,6 +38,12 @@ class BM25Search:
         self.doc_texts = all_docs["documents"]
         self.doc_metadatas = all_docs["metadatas"]
 
+        if not self.doc_ids:
+            self.index = None
+            self._is_built = False
+            print("[BM25] No documents in collection — BM25 disabled until ingestion.")
+            return
+
         tokenized = [self._tokenize(text) for text in self.doc_texts]
         self.index = BM25Okapi(tokenized)
         self._is_built = True

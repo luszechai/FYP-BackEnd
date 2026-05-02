@@ -1,6 +1,8 @@
 """Query enhancement module for better retrieval"""
 import re
 from typing import List, Dict
+from src.program_catalog import is_programme_code_query, programme_aliases
+from src.scholarship_catalog import is_scholarship_reference_query, scholarship_aliases
 
 
 class QueryEnhancer:
@@ -47,6 +49,14 @@ class QueryEnhancer:
             'phd': ['doctor of philosophy', 'doctoral', 'doctorate'],
             'mba': ['master of business administration', 'business masters'],
         }
+        for alias, expansions in programme_aliases().items():
+            existing = self.program_aliases.get(alias)
+            if existing is None:
+                self.program_aliases[alias] = expansions
+                continue
+            existing_values = existing if isinstance(existing, list) else [existing]
+            self.program_aliases[alias] = list(dict.fromkeys(existing_values + expansions))
+        self.scholarship_aliases = scholarship_aliases()
 
     def is_person_query(self, query: str) -> bool:
         """Detect if query is asking about a person"""
@@ -100,10 +110,12 @@ class QueryEnhancer:
             r'\bscholarship[s]?\b',
             r'\bfinancial\s+(aid|assistance|support)\b',
             r'\bbursary|bursaries\b',
+            r'\bsubsidy|subsidies\b',
+            r'\bloan\s+scheme\b',
             r'\bgrant[s]?\b.*\b(student|academic)\b',
             r'\b(academic|merit|need[- ]based)\s+award[s]?\b',
         ]
-        return any(re.search(p, query_lower) for p in scholarship_patterns)
+        return any(re.search(p, query_lower) for p in scholarship_patterns) or is_scholarship_reference_query(query)
 
     def _extract_scholarship_keywords(self, query: str) -> List[str]:
         """Extract scholarship-related keywords from query"""
@@ -114,7 +126,8 @@ class QueryEnhancer:
         scholarship_terms = [
             'scholarship', 'scholarships', 'bursary', 'bursaries', 
             'financial aid', 'grant', 'grants', 'award', 'awards',
-            'academic achievement', 'merit', 'need-based'
+            'academic achievement', 'merit', 'need-based', 'subsidy',
+            'financial assistance', 'student finance', 'loan scheme'
         ]
         
         for term in scholarship_terms:
@@ -123,6 +136,10 @@ class QueryEnhancer:
         
         # Add data format keywords that match the dataset
         keywords.extend(['scholarship_name', 'entrance_scholarships', 'admission_scholarships'])
+        for alias, expansions in self.scholarship_aliases.items():
+            if re.search(r'\b' + re.escape(alias) + r'\b', query_lower):
+                keywords.append(alias)
+                keywords.extend(expansions)
         
         # Check for listing intent
         list_patterns = ['list', 'what', 'which', 'available', 'types of', 
@@ -165,8 +182,13 @@ class QueryEnhancer:
             "scholarship",
             "scholarships offered",
             "financial aid scholarships",
-            "scholarship program"
+            "scholarship program",
+            "bursary financial assistance subsidy loan scheme"
         ])
+        for alias, expansions in self.scholarship_aliases.items():
+            if re.search(r'\b' + re.escape(alias) + r'\b', query_lower):
+                queries.extend(expansions)
+                queries.append(f"{alias} scholarship financial assistance")
         
         # Check for specific scholarship types mentioned
         if 'academic' in query_lower or 'achievement' in query_lower:
@@ -235,6 +257,9 @@ class QueryEnhancer:
         ]
 
         if re.search(course_code_pattern, query_lower):
+            return True
+
+        if is_programme_code_query(query):
             return True
 
         if any(kw in query_lower for kw in program_keywords):
@@ -360,7 +385,8 @@ class QueryEnhancer:
             queries.append(f"{subject.upper()}{number} syllabus")
 
         # B. Expand Degree Acronyms (BSc -> Bachelor of Science)
-        for word in query_lower.split():
+        words = re.findall(r"[\w-]+", query_lower)
+        for word in words:
             if word in self.program_aliases:
                 alias_value = self.program_aliases[word]
                 # Handle both string and list values

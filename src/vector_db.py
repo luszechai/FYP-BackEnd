@@ -304,7 +304,7 @@ class ChromaDBManager:
 
                 # Add email-specific structured fields
                 for email_field in (
-                    'email_type', 'email_name', 'email_period', 'email_details',
+                    'email_type', 'email_types', 'email_name', 'email_period', 'email_details',
                     'email_fees', 'email_time', 'email_requirements', 'email_links',
                     'email_subject', 'email_date',
                     'email_id', 'email_categorized_links', 'email_images',

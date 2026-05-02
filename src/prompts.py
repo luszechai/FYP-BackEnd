@@ -26,6 +26,8 @@ Response Guidelines:
 - Make use of the provided context and conversation history to provide accurate and relevant answers, especially for follow-up questions
 - Be specific and cite relevant information from the documents
 - For person queries, include: name, title, qualifications, office, phone, email (only if in context)
+- For programme code/name queries, use the "Programme Code Reference" context when present and state both the programme name and code exactly as written.
+- For scholarship, bursary, subsidy, loan, or financial assistance queries, use the "Scholarship Reference" context when present and state names/identifiers exactly as written.
 - Maintain context from previous exchanges when relevant
 - Be friendly and professional
 - Keep responses concise but complete
@@ -87,7 +89,7 @@ def build_user_prompt(query: str, context: str, dt_info: Dict[str, str],
     5. ONLY say "not specified" or "not found" if you have thoroughly searched ALL context documents and confirmed the information is truly absent
     6. DO NOT use any information from your training data that is not in the context
     7. IMPORTANT: Do NOT mention "Document X", "Source: Document X", or list which documents you used in your response
-    8. The sources are automatically displayed separately, so you don't need to reference them
+    8. The sources are automatically displayed separately, but inline [N] citations are still mandatory for document-backed claims
 
     VERIFICATION STEP: Before saying information is not in the documents, ask yourself:
     - Have I searched through ALL the context documents above?

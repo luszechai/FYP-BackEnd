@@ -14,6 +14,8 @@ from src.prompts import build_system_message, build_user_prompt
 from src.utils import get_current_datetime_info, is_deadline_query, should_skip_retrieval
 from src.adaptive_config import AdaptiveConfig
 from src.query_rewriter import rewrite_query
+from src.program_catalog import build_programme_code_reference_doc, is_programme_code_query
+from src.scholarship_catalog import build_scholarship_reference_doc, is_scholarship_reference_query
 
 
 class RAGChatbot:
@@ -176,7 +178,11 @@ class RAGChatbot:
     def retrieve_context(self, query: str, use_memory: bool = True) -> Tuple[List[Dict], str, Dict]:
         """Enhanced retrieval with query preprocessing"""
         # Skip retrieval for simple/non-informative queries (before rewriting)
-        if should_skip_retrieval(query):
+        if (
+            should_skip_retrieval(query)
+            and not is_programme_code_query(query)
+            and not is_scholarship_reference_query(query)
+        ):
             enhanced_query = self.query_enhancer.enhance_query(query)
             print("⏭️ Skipping retrieval for simple query")
             return [], "", enhanced_query
@@ -264,18 +270,40 @@ class RAGChatbot:
         filtered_docs = [d for d in retrieved_docs if d.get('retrieval_score', 0) >= threshold]
         top_results = filtered_docs[:k]
 
+        programme_reference_query = "\n".join(
+            value for value in [
+                query,
+                enhanced_query.get('original_raw', ''),
+                enhanced_query.get('rewritten', ''),
+            ]
+            if value
+        )
+        programme_reference_doc = build_programme_code_reference_doc(programme_reference_query)
+        if programme_reference_doc and not any(d.get('id') == programme_reference_doc['id'] for d in top_results):
+            top_results.insert(0, programme_reference_doc)
+            enhanced_query['programme_code_reference_injected'] = True
+
+        scholarship_reference_doc = build_scholarship_reference_doc(programme_reference_query)
+        if scholarship_reference_doc and not any(d.get('id') == scholarship_reference_doc['id'] for d in top_results):
+            insert_at = 1 if programme_reference_doc else 0
+            top_results.insert(insert_at, scholarship_reference_doc)
+            enhanced_query['scholarship_reference_injected'] = True
+
         context_parts = []
         max_doc_length = 2000
 
         for i, result in enumerate(top_results, start=1):
-            section = result['metadata'].get('section', 'Unknown Section')
+            metadata = dict(result.get('metadata', {}))
+            metadata['context_doc_num'] = i
+            result['metadata'] = metadata
+            section = metadata.get('section', 'Unknown Section')
             if section == 'email':
-                email_type = result['metadata'].get('email_type', '')
+                email_type = metadata.get('email_type', '')
                 if email_type:
                     section = f"email: {email_type}"
             content = result['document']
-            
-            if len(content) > max_doc_length:
+
+            if metadata.get('type') not in {'programme_code_reference', 'scholarship_reference'} and len(content) > max_doc_length:
                 content = content[:max_doc_length] + "... [truncated]"
             
             context_parts.append(f"[Document {i} - {section}] (Score: {result['retrieval_score']:.3f})\n{content}")

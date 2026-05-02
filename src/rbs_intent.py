@@ -15,11 +15,29 @@ _RBS_KEYWORDS = [
     "rbs", "vacancy", "vacant", "occupied", "free room",
     "reserve", "reservation", "study pod", "discussion room",
 ]
+_STRONG_RBS_KEYWORDS = [
+    "room", "booking", "rbs", "free room", "reserve", "reservation",
+    "study pod", "discussion room", "book a room", "room booking",
+]
+_ROOM_CONTEXT_WORDS = [
+    "free", "available", "booked", "schedule", "open",
+    "use", "check", "when", "today", "tomorrow",
+    "book", "reserve", "status", "slot",
+]
 _NON_RBS_KEYWORDS = [
     "admission", "tuition", "fee", "scholarship", "programme", "program",
     "faculty", "professor", "gpa", "ielts", "application form",
     "curriculum", "degree", "bachelor", "master", "credit",
 ]
+_AMBIGUOUS_FOLLOWUP_RE = re.compile(
+    r"^(?:"
+    r"(?:list|show|summari[sz]e|explain|detail|describe|give me|tell me)\s+"
+    r"(?:it|that|this|them|those|these|one|ones|all|the\s+(?:above|same))"
+    r"|(?:it|that|this|them|those|these)"
+    r"|(?:yes|yeah|yep|ok|okay|sure|please|do it|continue|go on)"
+    r")\.?$",
+    re.IGNORECASE,
+)
 
 _RBS_INTENT_SYSTEM = (
     "You are an intent classifier. Your task is to decide if the user's message is about "
@@ -37,23 +55,42 @@ _RBS_INTENT_SYSTEM = (
 def _detect_rbs_intent_keyword_fallback(query: str, previous_was_rbs: bool = False) -> bool:
     """Keyword-based fallback when LLM is unavailable or returns invalid response."""
     q = query.lower()
-    for kw in _RBS_KEYWORDS:
-        if kw in q:
-            return True
-    if _ROOM_PATTERN.search(query):
-        remaining = _ROOM_PATTERN.sub("", query).lower()
-        room_context_words = [
-            "free", "available", "booked", "schedule", "open",
-            "use", "check", "when", "today", "tomorrow",
-            "book", "reserve", "status", "slot",
-        ]
-        if any(w in remaining for w in room_context_words):
-            return True
+    if not previous_was_rbs and _is_ambiguous_followup(q):
+        return False
+    if not previous_was_rbs:
+        if _has_non_rbs_signal(q) and not _has_strong_rbs_signal(q):
+            return False
+        return _has_rbs_lexical_signal(query)
     if previous_was_rbs:
         if any(kw in q for kw in _NON_RBS_KEYWORDS):
             return False
         return True
     return False
+
+
+def _has_rbs_lexical_signal(query: str) -> bool:
+    """Return True when the current message itself contains an RBS-specific signal."""
+    q = query.lower()
+    if _has_strong_rbs_signal(q):
+        return True
+    if _ROOM_PATTERN.search(query):
+        remaining = _ROOM_PATTERN.sub("", query).lower()
+        return any(w in remaining for w in _ROOM_CONTEXT_WORDS)
+    return False
+
+
+def _is_ambiguous_followup(query_lower: str) -> bool:
+    """Short anaphoric commands need prior RBS context; alone they belong to normal chat."""
+    q = query_lower.strip()
+    return bool(_AMBIGUOUS_FOLLOWUP_RE.match(q))
+
+
+def _has_strong_rbs_signal(query_lower: str) -> bool:
+    return any(kw in query_lower for kw in _STRONG_RBS_KEYWORDS)
+
+
+def _has_non_rbs_signal(query_lower: str) -> bool:
+    return any(kw in query_lower for kw in _NON_RBS_KEYWORDS)
 
 
 def detect_rbs_intent(
@@ -74,6 +111,16 @@ def detect_rbs_intent(
         True if the query is about room booking, False otherwise.
     """
     if not query or not query.strip():
+        return False
+
+    # Do not ask the LLM to guess RBS for standalone follow-ups like "list it".
+    # They are only RBS when the immediately preceding exchange was RBS.
+    if not previous_was_rbs and _is_ambiguous_followup(query.lower()):
+        return False
+
+    # Without previous RBS context, require the current message to contain an
+    # explicit room/booking signal. This keeps generic RAG follow-ups out of RBS.
+    if not previous_was_rbs and not _has_rbs_lexical_signal(query):
         return False
 
     context_note = ""

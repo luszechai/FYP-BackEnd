@@ -43,6 +43,15 @@ _IMAGE_MIME_MAP = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+_JOBS_EVENTS_PHRASE = "[Jobs & Events]"
+_JOBS_EVENTS_TYPES = ["Job Recruitment", "events"]
+_VALID_EMAIL_TYPES = {
+    "scholarship",
+    "events",
+    "Member Recruitment",
+    "Job Recruitment",
+    "workshop",
+}
 
 _CLASSIFICATION_SYSTEM_MESSAGE = (
     "You are processing university emails for a student information chatbot.\n\n"
@@ -53,6 +62,9 @@ _CLASSIFICATION_SYSTEM_MESSAGE = (
     '   - "Member Recruitment" (成員招募) - member recruitment, club recruitment\n'
     '   - "Job Recruitment" (職位招募) - job postings, volunteer recruitment\n'
     '   - "workshop" (工作坊) - workshop, seminar, training\n\n'
+    f'   IMPORTANT: if the email subject/body contains the exact phrase "{_JOBS_EVENTS_PHRASE}", '
+    'it belongs to BOTH "Job Recruitment" and "events". Use "Job Recruitment" as "type" '
+    'and include both values in "types".\n\n'
     '2. EXTRACT structured information (leave empty string "" if not found):\n'
     "   - name: The name/title of the scholarship, event, or recruitment\n"
     '   - introduction: Introduction of the scholarship, event, or recruitment(a short summary of the email, or extraction of the main content of the email)\n'
@@ -73,6 +85,7 @@ _CLASSIFICATION_SYSTEM_MESSAGE = (
     "Return your response as a JSON object with these exact keys:\n"
     "{\n"
     '  "type": "scholarship" | "events" | "Member Recruitment"| "Job Recruitment" | "workshop",\n'
+    '  "types": ["scholarship" | "events" | "Member Recruitment" | "Job Recruitment" | "workshop"],\n'
     '  "name": "...",\n'
     '  "introduction": "...",\n'
     '  "application_period": "...",\n'
@@ -468,6 +481,29 @@ def _extract_non_image_text(attachments: List[Tuple[str, bytes]]) -> str:
     return "\n\n".join(texts)
 
 
+def _detect_forced_email_types(*parts: str) -> List[str]:
+    """Return deterministic categories for exact subject/body markers."""
+    if any(_JOBS_EVENTS_PHRASE in (part or "") for part in parts):
+        return list(_JOBS_EVENTS_TYPES)
+    return []
+
+
+def _resolve_email_types(result: Dict, forced_types: List[str]) -> List[str]:
+    """Normalize model output to the categories supported by the app."""
+    if forced_types:
+        return list(forced_types)
+
+    raw_types = result.get("types") or result.get("type") or []
+    if isinstance(raw_types, str):
+        raw_types = [raw_types]
+
+    normalized: List[str] = []
+    for value in raw_types:
+        if value in _VALID_EMAIL_TYPES and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
 def _process_email_with_kimi(
     llm: Optional[LLMProvider],
     subject: str,
@@ -491,10 +527,13 @@ def _process_email_with_kimi(
     prompt = "\n\n".join(parts)
 
     fallback_links = [{"url": u, "category": "other"} for u in discovered_links]
+    forced_types = _detect_forced_email_types(subject, body, attachment_text)
 
     if llm is None:
+        email_type = forced_types[0] if forced_types else ""
         return {
-            "type": "",
+            "type": email_type,
+            "types": forced_types,
             "name": subject,
             "introduction": "",
             "application_period": "",
@@ -556,8 +595,10 @@ def _process_email_with_kimi(
         application_period = result.get("application_period", "") or result.get("period", "")
         event_period = result.get("event_period", "") or result.get("period", "")
         event_time = result.get("event_time", "") or result.get("time", "")
+        email_types = _resolve_email_types(result, forced_types)
         return {
-            "type": result.get("type", ""),
+            "type": email_types[0] if email_types else result.get("type", ""),
+            "types": email_types,
             "name": result.get("name", ""),
             "introduction": result.get("introduction", ""),
             "application_period": application_period,
@@ -572,8 +613,10 @@ def _process_email_with_kimi(
 
     except json.JSONDecodeError:
         print("⚠️ Kimi did not return valid JSON; using raw response as full_text.")
+        email_type = forced_types[0] if forced_types else ""
         return {
-            "type": "",
+            "type": email_type,
+            "types": forced_types,
             "name": subject,
             "introduction": "",
             "application_period": "",
@@ -587,8 +630,10 @@ def _process_email_with_kimi(
         }
     except Exception as e:
         print(f"⚠️ Kimi processing failed: {e}")
+        email_type = forced_types[0] if forced_types else ""
         return {
-            "type": "",
+            "type": email_type,
+            "types": forced_types,
             "name": subject,
             "introduction": "",
             "application_period": "",
@@ -614,8 +659,13 @@ def _build_document_content(info: Dict) -> str:
     }
     lines: List[str] = []
 
-    email_type = info.get("type", "")
-    if email_type:
+    email_types = info.get("types") or [info.get("type", "")]
+    email_types = [email_type for email_type in email_types if email_type]
+    if len(email_types) > 1:
+        labels = [type_labels.get(email_type, email_type) for email_type in email_types]
+        lines.append(f"Email Types: {', '.join(labels)}")
+    elif email_types:
+        email_type = email_types[0]
         lines.append(f"Email Type: {type_labels.get(email_type, email_type)}")
     if info.get("name"):
         lines.append(f"Name: {info['name']}")
@@ -724,9 +774,18 @@ def fetch_and_ingest_emails():
                 image_attachments, discovered_links,
             )
 
-            doc_content = _build_document_content(info)
+            category_types = info.get("types") or []
+            if not category_types and info.get("type"):
+                category_types = [info["type"]]
+            category_types = category_types or [""]
+            email_types_json = json.dumps(category_types, ensure_ascii=False)
 
-            if doc_content.strip():
+            for category_type in category_types:
+                doc_info = {**info, "type": category_type}
+                doc_content = _build_document_content(doc_info)
+                if not doc_content.strip():
+                    continue
+
                 cat_links = info.get("links", [])
                 if cat_links and isinstance(cat_links[0], str):
                     cat_links = [{"url": u, "category": "other"} for u in cat_links]
@@ -740,10 +799,11 @@ def fetch_and_ingest_emails():
                 all_docs.append({
                     "content": doc_content,
                     "metadata": {
-                        "source": f"email:{subject}",
+                        "source": f"email:{eid}",
                         "type": "email",
                         "section": "email",
-                        "email_type": info.get("type", ""),
+                        "email_type": category_type,
+                        "email_types": email_types_json,
                         "email_name": info.get("name", ""),
                         "email_introduction": info.get("introduction", ""),
                         "email_application_period": application_period,
