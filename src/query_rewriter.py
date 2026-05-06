@@ -137,9 +137,9 @@ def rewrite_query(llm: LLMProvider, query: str,
         rewritten = rewritten.strip().strip('"').strip("'")
         if rewritten and 3 < len(rewritten) < 300:
             rewritten = _apply_known_code_guard(query, rewritten)
-            print(f"✏️ Query rewritten: '{query}' → '{rewritten}'")
+            print(f"[rewriter] query rewritten: '{query}' -> '{rewritten}'")
             return rewritten
     except Exception as e:
-        print(f"⚠️ Query rewrite failed ({e}), using original")
+        print(f"[rewriter][warn] query rewrite failed ({e}), using original")
 
     return query

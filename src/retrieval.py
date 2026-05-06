@@ -43,7 +43,7 @@ class HybridRetriever:
         # Adjust retrieval size for scholarship queries
         base_n_results = self.retrieval_k * 3 if is_scholarship else self.retrieval_k * 2
 
-        print(f"🔍 Strategy 1: Baseline vector query (k={base_n_results})")
+        print(f"[retrieval] strategy 1: baseline vector query (k={base_n_results})")
         results = self.db.query(query_text=enhanced_query['original'], n_results=base_n_results)
         for doc in self.db.format_results(results):
             doc_id = doc['id']
@@ -59,7 +59,7 @@ class HybridRetriever:
         # Strategy 1.6: Scholarship-specific queries (enhanced for listing queries)
         is_scholarship_enhanced = is_scholarship or enhanced_query.get('is_scholarship_query', False)
         if self.use_hybrid and is_scholarship_enhanced:
-            print(f"🔍 Strategy 1.6: Scholarship queries (listing + deadline)")
+            print("[retrieval] strategy 1.6: scholarship queries (listing + deadline)")
             
             # Check if this is a listing query (asking for available scholarships)
             list_patterns = ['list', 'what', 'which', 'available', 'types of', 
@@ -117,7 +117,7 @@ class HybridRetriever:
                     doc['retrieval_score'] = min(1.0, doc['retrieval_score'] + boost)
 
         if self.use_hybrid and self.use_person_boost and enhanced_query.get('is_person_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
-            print(f"🔍 Strategy 2: Expanded person queries ({len(enhanced_query['expanded_queries'])} variations)")
+            print(f"[retrieval] strategy 2: expanded person queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:3]:
                 results = self.db.query(query_text=exp_query, n_results=self.retrieval_k)
@@ -134,7 +134,7 @@ class HybridRetriever:
 
         # Strategy 2.3: Expanded Role Queries (for queries like "who is the programme leader of AI")
         if self.use_hybrid and enhanced_query.get('is_role_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
-            print(f"🔍 Strategy 2.3: Expanded role queries ({len(enhanced_query['expanded_queries'])} variations)")
+            print(f"[retrieval] strategy 2.3: expanded role queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:5]:
                 results = self.db.query(query_text=exp_query, n_results=self.retrieval_k)
@@ -151,7 +151,7 @@ class HybridRetriever:
 
         # Strategy 2.5: Expanded Program Queries
         if self.use_hybrid and enhanced_query.get('is_program_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
-            print(f"🔍 Strategy 2.5: Expanded Program queries ({len(enhanced_query['expanded_queries'])} variations)")
+            print(f"[retrieval] strategy 2.5: expanded program queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:4]:
                 results = self.db.query(query_text=exp_query, n_results=self.retrieval_k)
@@ -168,7 +168,7 @@ class HybridRetriever:
 
         # Strategy 2.6: Expanded Scholarship Queries
         if self.use_hybrid and enhanced_query.get('is_scholarship_query', False) and len(enhanced_query.get('expanded_queries', [])) > 1:
-            print(f"🔍 Strategy 2.6: Expanded Scholarship queries ({len(enhanced_query['expanded_queries'])} variations)")
+            print(f"[retrieval] strategy 2.6: expanded scholarship queries ({len(enhanced_query['expanded_queries'])} variations)")
 
             for exp_query in enhanced_query['expanded_queries'][:6]:
                 results = self.db.query(query_text=exp_query, n_results=self.retrieval_k)
@@ -185,7 +185,7 @@ class HybridRetriever:
 
         # Strategy 3: Keyword matching with context boosting
         if self.use_hybrid and enhanced_query.get('keywords'):
-            print(f"🔍 Strategy 3: Keyword matching")
+            print("[retrieval] strategy 3: keyword matching")
             for doc_id, doc in all_results.items():
                 content_lower = doc['document'].lower()
 
@@ -209,7 +209,7 @@ class HybridRetriever:
 
         # Strategy 3.5: Role-specific keyword boosting
         if self.use_hybrid and enhanced_query.get('is_role_query', False):
-            print(f"🔍 Strategy 3.5: Role-specific keyword boosting")
+            print("[retrieval] strategy 3.5: role-specific keyword boosting")
             role_keywords = ['programme leader', 'program leader', 'director', 'head of', 
                            'role', 'coordinator', 'dean', 'chair']
             for doc_id, doc in all_results.items():
@@ -228,7 +228,7 @@ class HybridRetriever:
             if '\nCurrent question: ' in raw_query:
                 raw_query = raw_query.split('\nCurrent question: ')[-1]
 
-            print(f"🔍 Strategy BM25: Keyword search (k={bm25_k})")
+            print(f"[retrieval] strategy bm25: keyword search (k={bm25_k})")
             bm25_results = self.bm25.search(raw_query, k=bm25_k)
 
             if not self.use_hybrid or not all_results:
@@ -352,13 +352,13 @@ class HybridRetriever:
                 )
 
         if injected:
-            msg = f"📧 Injected {injected} email(s) for category '{email_cat}'"
+            msg = f"[email] injected {injected} email(s) for category '{email_cat}'"
             if skipped_expired:
                 msg += f" (skipped {skipped_expired} expired email(s))"
             print(msg)
         elif skipped_expired:
             print(
-                f"📧 Skipped {skipped_expired} expired email(s) "
+                f"[email] skipped {skipped_expired} expired email(s) "
                 f"for category '{email_cat}'"
             )
 

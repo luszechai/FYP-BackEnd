@@ -72,7 +72,7 @@ class RAGChatbot:
             else:
                 self.reranker = Reranker(model_name="BAAI/bge-reranker-base", use_fp16=True)
             if not self.reranker.is_available:
-                print("⚠️ Reranker failed to load — falling back to bi-encoder scoring only")
+                print("[chatbot][warn] reranker failed to load — falling back to bi-encoder scoring only")
                 self.use_reranker = False
         else:
             self.reranker = None
@@ -86,11 +86,11 @@ class RAGChatbot:
         self.MAX_FILE_CHARS = 15000
         self.MAX_TOTAL_FILE_CONTEXT = 30000
 
-        print(f"RAG Chatbot initialized with {self.db.collection.count()} documents")
+        print(f"[chatbot] initialized with {self.db.collection.count()} documents")
         if use_adaptive_config:
-            print("✅ Adaptive configuration enabled - parameters will adjust automatically")
+            print("[chatbot] adaptive config enabled - parameters will adjust automatically")
         if self.use_reranker:
-            print("✅ Reranker enabled — documents will be re-scored with cross-encoder")
+            print("[chatbot] reranker enabled — documents will be re-scored with cross-encoder")
 
     # ---- Session file management ----
 
@@ -112,14 +112,14 @@ class RAGChatbot:
             'uploaded_at': datetime.now().isoformat(),
             'truncated': truncated
         })
-        print(f"📎 Session file added: {filename} ({len(content)} chars, truncated={truncated})")
+        print(f"[chatbot] session file added: {filename} ({len(content)} chars, truncated={truncated})")
 
     def remove_session_file(self, file_id: str) -> bool:
         """Remove a session file by ID. Returns True if found and removed."""
         for i, f in enumerate(self.session_files):
             if f['id'] == file_id:
                 removed = self.session_files.pop(i)
-                print(f"🗑️ Session file removed: {removed['filename']}")
+                print(f"[chatbot] session file removed: {removed['filename']}")
                 return True
         return False
 
@@ -140,7 +140,7 @@ class RAGChatbot:
         """Remove all session files"""
         count = len(self.session_files)
         self.session_files.clear()
-        print(f"🧹 Cleared {count} session file(s)")
+        print(f"[chatbot] cleared {count} session file(s)")
 
     def format_session_file_context(self) -> str:
         """
@@ -184,7 +184,7 @@ class RAGChatbot:
             and not is_scholarship_reference_query(query)
         ):
             enhanced_query = self.query_enhancer.enhance_query(query)
-            print("⏭️ Skipping retrieval for simple query")
+            print("[chatbot] skipping retrieval for simple query")
             return [], "", enhanced_query
 
         # Fetch memory context BEFORE rewriting so the rewriter can resolve
@@ -389,7 +389,7 @@ class RAGChatbot:
 
     def chat(self, query: str, use_memory: bool = True) -> Dict:
         """Process a chat query with performance tracking"""
-        print(f"\n🤔 Processing query: '{query}'")
+        print(f"\n[chatbot] processing query: '{query}'")
 
         # Start timing
         start_time = time.time()
@@ -432,7 +432,7 @@ class RAGChatbot:
         }
         self.session_metrics.append(metric)
 
-        print(f"⏱️ Response time: {total_time:.3f}s (Retrieval: {retrieval_time:.3f}s, Generation: {generation_time:.3f}s)")
+        print(f"[chatbot] response time: {total_time:.3f}s (retrieval: {retrieval_time:.3f}s, generation: {generation_time:.3f}s)")
 
         # Update memory
         context_ids = [doc['id'] for doc in retrieved_docs]

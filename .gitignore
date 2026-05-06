@@ -58,3 +58,4 @@ rag_evaluation_*.png
 .DS_Store
 Thumbs.db
 
+/email_assets

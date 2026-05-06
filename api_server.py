@@ -1,5 +1,6 @@
 """FastAPI server for SFU Admission Chatbot"""
 import os
+import sys
 # Load .env and set HF timeouts before ANY other import (avoids ReadTimeoutError on slow networks).
 # Must patch constants and requests so no code path uses the default 10s for Hugging Face.
 from dotenv import load_dotenv
@@ -30,6 +31,14 @@ try:
     requests.Session.request = _request_with_hf_timeout
 except ImportError:
     pass
+
+# Windows console often uses cp950/mbcs; avoid crashing on non-ascii prints.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
@@ -40,6 +49,7 @@ from datetime import datetime, timedelta
 import uuid
 import tempfile
 import pandas as pd
+import numpy as np
 from src.chatbot import RAGChatbot
 from src.llm_provider import LLMProvider
 from src.vector_db import ChromaDBManager
@@ -148,6 +158,13 @@ class StatsResponse(BaseModel):
     avg_similarity: float
     hit_rate: float
     metrics: List[Dict]
+    # --- Extended RAG session KPI (backward compatible) ---
+    latency_p95: float = 0.0
+    cited_answer_rate: float = 0.0  # percent [0, 100]
+    avg_citations: float = 0.0
+    time_breakdown: Dict = {}
+    hit_rate_method: str = "max_similarity"
+    hit_rate_threshold: float = 0.5
 
 
 class HistoryResponse(BaseModel):
@@ -184,7 +201,7 @@ async def startup_event():
     try:
         Config.validate()
         
-        print("🔧 Setting up chatbot components...")
+        print("[startup] Setting up chatbot components...")
         llm = LLMProvider(
             provider="deepseek",
             api_key=Config.DEEPSEEK_API_KEY,
@@ -209,7 +226,7 @@ async def startup_event():
             )
             llm_providers["kimi"] = kimi_llm
         else:
-            print("⚠️ KIMI_API_KEY not set – Kimi provider will be unavailable.")
+            print("[startup][warn] KIMI_API_KEY not set – Kimi provider will be unavailable.")
         
         db = ChromaDBManager(
             persist_directory=Config.CHROMA_DB_DIR,
@@ -219,9 +236,9 @@ async def startup_event():
             if os.path.exists(Config.DATA_FILE):
                 db.add_documents_from_json(Config.DATA_FILE)
             else:
-                print(f"⚠️ {Config.DATA_FILE} not found!")
+                print(f"[startup][warn] {Config.DATA_FILE} not found!")
         else:
-            print(f"📚 Loaded {db.collection.count()} documents from persistence.")
+            print(f"[startup] Loaded {db.collection.count()} documents from persistence.")
         
         chatbot_instance = RAGChatbot(
             chroma_db=db,
@@ -230,10 +247,10 @@ async def startup_event():
             use_reranker=Config.USE_RERANKER
         )
         
-        print(f"✅ Chatbot initialized! Available providers: {list(llm_providers.keys())}")
+        print(f"[startup] Chatbot initialized. Available providers: {list(llm_providers.keys())}")
         
     except Exception as e:
-        print(f"❌ Failed to initialize chatbot: {e}")
+        print(f"[startup][error] Failed to initialize chatbot: {e}")
         import traceback
         traceback.print_exc()
 
@@ -1229,6 +1246,8 @@ async def chat_stream(request: ChatRequest):
     
     async def generate():
         global _last_exchange_was_rbs
+        metric: Optional[Dict] = None
+        metric_start = time.time()
         try:
             from src.utils import get_current_datetime_info
             from src.prompts import build_system_message, build_user_prompt, build_rbs_system_message, build_rbs_user_prompt
@@ -1293,6 +1312,31 @@ async def chat_stream(request: ChatRequest):
                     chatbot_instance.memory.add_exchange(request.query, full_response, [])
                     _last_exchange_was_rbs = True
                     performance = {"total_time": round(generation_time, 3), "retrieval_time": 0.0, "generation_time": round(generation_time, 3)}
+                    # Record a lightweight metric (RBS is still a "query" for session stats)
+                    try:
+                        query_category = chatbot_instance.query_enhancer.categorize_query(request.query)
+                    except Exception:
+                        query_category = "unknown"
+                    metric = {
+                        "id": str(uuid.uuid4())[:8],
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "query": request.query,
+                        "category": query_category,
+                        "status": "success",
+                        "path": "rbs",
+                        "provider": request.provider,
+                        "retrieved_any": False,
+                        "hit": False,  # legacy
+                        "avg_similarity": 0.0,
+                        "max_similarity": 0.0,
+                        "min_similarity": 0.0,
+                        "num_docs": 0,
+                        "num_cited_sources": 0,
+                        "cited_answer": False,
+                        "response_time": float(time.time() - metric_start),
+                        "retrieval_time": 0.0,
+                        "generation_time": float(generation_time),
+                    }
                     yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
                     return
 
@@ -1363,6 +1407,31 @@ async def chat_stream(request: ChatRequest):
                     "retrieval_time": 0.0,
                     "generation_time": round(generation_time, 3),
                 }
+                # Record a lightweight metric (RBS path)
+                try:
+                    query_category = chatbot_instance.query_enhancer.categorize_query(request.query)
+                except Exception:
+                    query_category = "unknown"
+                metric = {
+                    "id": str(uuid.uuid4())[:8],
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "query": request.query,
+                    "category": query_category,
+                    "status": "success",
+                    "path": "rbs",
+                    "provider": request.provider,
+                    "retrieved_any": False,
+                    "hit": False,  # legacy
+                    "avg_similarity": 0.0,
+                    "max_similarity": 0.0,
+                    "min_similarity": 0.0,
+                    "num_docs": 0,
+                    "num_cited_sources": 0,
+                    "cited_answer": False,
+                    "response_time": float(time.time() - metric_start),
+                    "retrieval_time": 0.0,
+                    "generation_time": float(generation_time),
+                }
                 yield f"data: {json.dumps({'type': 'done', 'full_response': full_response, 'performance': performance})}\n\n"
                 return
 
@@ -1427,10 +1496,119 @@ async def chat_stream(request: ChatRequest):
                 "retrieval_time": round(retrieval_time, 3),
                 "generation_time": round(generation_time, 3),
             }
+            # Record session metric (RAG path)
+            try:
+                query_category = chatbot_instance.query_enhancer.categorize_query(request.query)
+            except Exception:
+                query_category = "unknown"
+
+            def _doc_score(doc: Dict) -> float:
+                try:
+                    return float(doc.get("retrieval_score", doc.get("similarity", 0)) or 0)
+                except Exception:
+                    return 0.0
+
+            scores = [_doc_score(d) for d in retrieved_docs] if retrieved_docs else []
+            avg_score = float(np.mean(scores)) if scores else 0.0
+            max_score = float(max(scores)) if scores else 0.0
+            min_score = float(min(scores)) if scores else 0.0
+            num_cited = int(len(cited_sources or []))
+            metric = {
+                "id": str(uuid.uuid4())[:8],
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "query": request.query,
+                "category": query_category,
+                "status": "success",
+                "path": "rag",
+                "provider": request.provider,
+                "retrieved_any": bool(retrieved_docs),
+                "hit": bool(retrieved_docs),  # legacy (retrieved any)
+                "avg_similarity": avg_score,
+                "max_similarity": max_score,
+                "min_similarity": min_score,
+                "num_docs": int(len(retrieved_docs or [])),
+                "num_cited_sources": num_cited,
+                "cited_answer": bool(num_cited > 0),
+                "response_time": float(time.time() - metric_start),
+                "retrieval_time": float(retrieval_time),
+                "generation_time": float(generation_time),
+            }
             yield f"data: {json.dumps({'type': 'done', 'full_response': final_response, 'sources': cited_sources, 'performance': performance})}\n\n"
             
+        except asyncio.CancelledError:
+            # Client disconnected / request cancelled
+            try:
+                if metric is None:
+                    try:
+                        query_category = chatbot_instance.query_enhancer.categorize_query(request.query)
+                    except Exception:
+                        query_category = "unknown"
+                    metric = {
+                        "id": str(uuid.uuid4())[:8],
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "query": request.query,
+                        "category": query_category,
+                        "status": "cancelled",
+                        "path": "unknown",
+                        "provider": request.provider,
+                        "retrieved_any": False,
+                        "hit": False,
+                        "avg_similarity": 0.0,
+                        "max_similarity": 0.0,
+                        "min_similarity": 0.0,
+                        "num_docs": 0,
+                        "num_cited_sources": 0,
+                        "cited_answer": False,
+                        "response_time": float(time.time() - metric_start),
+                        "retrieval_time": 0.0,
+                        "generation_time": 0.0,
+                        "error_type": "cancelled",
+                    }
+                chatbot_instance.session_metrics.append(metric)
+            except Exception:
+                pass
+            raise
         except Exception as e:
+            # Record failed metric (best-effort) then stream error
+            try:
+                if metric is None:
+                    try:
+                        query_category = chatbot_instance.query_enhancer.categorize_query(request.query)
+                    except Exception:
+                        query_category = "unknown"
+                    metric = {
+                        "id": str(uuid.uuid4())[:8],
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "query": request.query,
+                        "category": query_category,
+                        "status": "error",
+                        "path": "unknown",
+                        "provider": request.provider,
+                        "retrieved_any": False,
+                        "hit": False,
+                        "avg_similarity": 0.0,
+                        "max_similarity": 0.0,
+                        "min_similarity": 0.0,
+                        "num_docs": 0,
+                        "num_cited_sources": 0,
+                        "cited_answer": False,
+                        "response_time": float(time.time() - metric_start),
+                        "retrieval_time": 0.0,
+                        "generation_time": 0.0,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                    }
+                chatbot_instance.session_metrics.append(metric)
+            except Exception:
+                pass
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            # Success path metric append (best-effort). Error/cancel already appended above.
+            try:
+                if metric is not None and metric.get("status") == "success":
+                    chatbot_instance.session_metrics.append(metric)
+            except Exception:
+                pass
     
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -1920,46 +2098,123 @@ async def get_stats(
     if chatbot_instance is None:
         raise HTTPException(status_code=503, detail="Chatbot not initialized")
     
+    def _percentile(values: List[float], p: float) -> float:
+        vals = [float(v) for v in values if v is not None]
+        if not vals:
+            return 0.0
+        vals.sort()
+        if len(vals) == 1:
+            return float(vals[0])
+        # inclusive rank
+        k = (len(vals) - 1) * (p / 100.0)
+        f = int(np.floor(k))
+        c = int(np.ceil(k))
+        if f == c:
+            return float(vals[f])
+        d0 = vals[f] * (c - k)
+        d1 = vals[c] * (k - f)
+        return float(d0 + d1)
+
     if not chatbot_instance.session_metrics:
         return StatsResponse(
             total_queries=0,
             avg_response_time=0.0,
             avg_similarity=0.0,
             hit_rate=0.0,
-            metrics=[]
+            metrics=[],
+            latency_p95=0.0,
+            cited_answer_rate=0.0,
+            avg_citations=0.0,
+            time_breakdown={
+                "retrieval": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+                "generation": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+                "end_to_end": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+            },
+            hit_rate_method=hit_rate_method,
+            hit_rate_threshold=hit_rate_threshold,
         )
     
     df = pd.DataFrame(chatbot_instance.session_metrics)
+
+    # KPI/time breakdown should reflect completed successful responses only.
+    all_metrics = list(chatbot_instance.session_metrics)
+    success_metrics = [m for m in all_metrics if (m.get("status") or "success") == "success"]
     
     # Use new evaluation method instead of old 'hit' field
     hit_rate = calculate_hit_rate(
-        chatbot_instance.session_metrics,
+        success_metrics,
         method=hit_rate_method,
         threshold=hit_rate_threshold
     ) * 100  # Convert to percentage
     
-    # Convert metrics to JSON-serializable format
+    # Convert metrics to JSON-serializable format + compute per-metric hit_by_method
     metrics = []
-    for metric in chatbot_instance.session_metrics:
+    for metric in all_metrics:
+        metric_for_eval = {
+            "max_similarity": float(metric.get("max_similarity", 0.0) or 0.0),
+            "avg_similarity": float(metric.get("avg_similarity", 0.0) or 0.0),
+            "num_docs": int(metric.get("num_docs", 0) or 0),
+        }
+        hit_by_method = calculate_hit_rate([metric_for_eval], method=hit_rate_method, threshold=hit_rate_threshold) >= 1.0
+
         metrics.append({
-            "query": metric['query'],
-            "category": metric['category'],
-            "hit": bool(metric['hit']),  # Keep for backward compatibility
-            "avg_similarity": float(metric['avg_similarity']),
-            "max_similarity": float(metric['max_similarity']),
-            "min_similarity": float(metric['min_similarity']),
-            "num_docs": int(metric['num_docs']),
-            "response_time": float(metric['response_time']),
-            "retrieval_time": float(metric['retrieval_time']),
-            "generation_time": float(metric['generation_time'])
+            "id": metric.get("id", ""),
+            "ts": metric.get("ts", ""),
+            "query": metric.get("query", ""),
+            "category": metric.get("category", "unknown"),
+            "status": metric.get("status", "success"),
+            "path": metric.get("path", "rag"),
+            "provider": metric.get("provider"),
+            "retrieved_any": bool(metric.get("retrieved_any", False)),
+            "hit": bool(metric.get("hit", False)),  # legacy: retrieved_any
+            "hit_by_method": bool(hit_by_method),
+            "avg_similarity": float(metric.get("avg_similarity", 0.0) or 0.0),
+            "max_similarity": float(metric.get("max_similarity", 0.0) or 0.0),
+            "min_similarity": float(metric.get("min_similarity", 0.0) or 0.0),
+            "num_docs": int(metric.get("num_docs", 0) or 0),
+            "num_cited_sources": int(metric.get("num_cited_sources", 0) or 0),
+            "cited_answer": bool(metric.get("cited_answer", False)),
+            "response_time": float(metric.get("response_time", 0.0) or 0.0),
+            "retrieval_time": float(metric.get("retrieval_time", 0.0) or 0.0),
+            "generation_time": float(metric.get("generation_time", 0.0) or 0.0),
+            "error_type": metric.get("error_type"),
         })
+
+    total_success = len(success_metrics)
+    cited_count = sum(1 for m in success_metrics if bool(m.get("cited_answer")))
+    citations_total = sum(int(m.get("num_cited_sources", 0) or 0) for m in success_metrics)
+    response_times = [float(m.get("response_time", 0.0) or 0.0) for m in success_metrics]
+    retrieval_times = [float(m.get("retrieval_time", 0.0) or 0.0) for m in success_metrics]
+    generation_times = [float(m.get("generation_time", 0.0) or 0.0) for m in success_metrics]
     
     return StatsResponse(
         total_queries=len(df),
-        avg_response_time=float(df['response_time'].mean()),
-        avg_similarity=float(df['avg_similarity'].mean()),
+        avg_response_time=float(pd.DataFrame(success_metrics)['response_time'].mean()) if total_success else 0.0,
+        avg_similarity=float(pd.DataFrame(success_metrics)['avg_similarity'].mean()) if total_success else 0.0,
         hit_rate=float(hit_rate),  # Use new calculation
-        metrics=metrics
+        metrics=metrics,
+        latency_p95=_percentile(response_times, 95),
+        cited_answer_rate=(cited_count / total_success * 100.0) if total_success else 0.0,
+        avg_citations=(citations_total / total_success) if total_success else 0.0,
+        time_breakdown={
+            "retrieval": {
+                "avg": float(np.mean(retrieval_times)) if retrieval_times else 0.0,
+                "p50": _percentile(retrieval_times, 50),
+                "p95": _percentile(retrieval_times, 95),
+            },
+            "generation": {
+                "avg": float(np.mean(generation_times)) if generation_times else 0.0,
+                "p50": _percentile(generation_times, 50),
+                "p95": _percentile(generation_times, 95),
+            },
+            "end_to_end": {
+                "avg": float(np.mean(response_times)) if response_times else 0.0,
+                "p50": _percentile(response_times, 50),
+                "p95": _percentile(response_times, 95),
+            },
+        },
+        hit_rate_method=hit_rate_method,
+        hit_rate_threshold=hit_rate_threshold,
     )
 
 
