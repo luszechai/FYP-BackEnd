@@ -236,7 +236,6 @@ class HybridRetriever:
                 for doc in bm25_results:
                     doc['retrieval_score'] = doc.get('bm25_score', 1.0 / (doc.get('rank', 1) + 1))
                 all_results = {doc['id']: doc for doc in bm25_results}
-                self._inject_email_aggregates(all_results, raw_query)
             else:
                 # Build a vector ranking list (sorted by current retrieval_score)
                 vector_ranking = sorted(
@@ -247,11 +246,19 @@ class HybridRetriever:
                 # Fuse vector + BM25 rankings with RRF
                 fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
                 all_results = {doc['id']: doc for doc in fused}
-                self._inject_email_aggregates(all_results, raw_query)
         elif self.use_hybrid:
             # Assign retrieval_score for documents that may only have similarity.
             for doc in all_results.values():
                 doc.setdefault('retrieval_score', doc.get('similarity', 0))
+
+        # Email aggregate injection should not depend on BM25 being enabled/available.
+        # Otherwise, category queries like "next workshop" regress when running in
+        # vector-only mode (or BM25 index build fails).
+        try:
+            self._inject_email_aggregates(all_results, enhanced_query.get('original', ''))
+        except Exception:
+            # Retrieval must never fail due to email injection.
+            pass
 
         deduplicated = self._deduplicate_results(list(all_results.values()))
         sorted_results = sorted(deduplicated,
@@ -293,10 +300,11 @@ class HybridRetriever:
         if not email_cat:
             return
 
-        where_filter = {"$and": [
-            {"type": {"$eq": "email"}},
-            {"email_type": {"$eq": email_cat}},
-        ]}
+        # Chroma "where" filters are an implicit AND across fields. Avoid $and/$eq
+        # because operator support differs across Chroma versions.
+        # Some Chroma builds only accept a single top-level predicate in `where`.
+        # Filter by `email_type` in Chroma, then validate `type` in Python.
+        where_filter = {"email_type": email_cat}
         try:
             email_results = self.db.collection.get(
                 where=where_filter,
@@ -305,7 +313,13 @@ class HybridRetriever:
         except Exception:
             email_results = {"ids": [], "documents": [], "metadatas": []}
 
-        email_ids = email_results.get("ids", [])
+        # Ensure we're only aggregating true email chunks.
+        email_ids = []
+        for idx, _id in enumerate(email_results.get("ids", []) or []):
+            meta = (email_results.get("metadatas", []) or [])
+            m = meta[idx] if idx < len(meta) and meta[idx] else {}
+            if (m.get("type") or "") == "email":
+                email_ids.append(_id)
         if not email_ids:
             return
 

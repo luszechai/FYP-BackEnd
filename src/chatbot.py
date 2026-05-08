@@ -261,13 +261,49 @@ class RAGChatbot:
         # Rerank candidates with cross-encoder for more precise relevance scoring
         RERANKER_TOP_K = 10  # Keep the top 10 documents after reranking
         if self.use_reranker and retrieved_docs:
-            # Use the raw query (without memory prepended) for reranking
-            retrieved_docs = self.reranker.rerank(query, retrieved_docs, top_k=RERANKER_TOP_K)
+            # Email aggregates can be injected with a very high retrieval_score, but the
+            # cross-encoder reranker normalizes and overwrites retrieval_score for all docs.
+            # That can accidentally demote injected emails (e.g., "next workshop") and the
+            # model answers using older website docs. We pin injected email aggregates to
+            # the top and rerank the remaining docs to fill the rest of the budget.
+
+            def _is_pinned_email_doc(d: Dict) -> bool:
+                try:
+                    if not isinstance(d, dict):
+                        return False
+                    doc_id = str(d.get("id", "") or "")
+                    meta = d.get("metadata", {}) or {}
+                    return doc_id.startswith("email:") and (meta.get("type") == "email" or meta.get("section") == "email")
+                except Exception:
+                    return False
+
+            pinned_docs = [d for d in retrieved_docs if _is_pinned_email_doc(d)]
+            other_docs = [d for d in retrieved_docs if d not in pinned_docs]
+
+            if pinned_docs:
+                enhanced_query["email_injected_pinned"] = True
+
+            remaining_k = max(RERANKER_TOP_K - len(pinned_docs), 0)
+            reranked_others = []
+            if remaining_k > 0 and other_docs:
+                # Use the raw query (without memory prepended) for reranking
+                reranked_others = self.reranker.rerank(query, other_docs, top_k=remaining_k)
+
+            # Keep pinned docs in front; preserve original order for stability
+            retrieved_docs = pinned_docs + reranked_others
+
             # After reranking, use a lower threshold since scores are normalized [0, 1]
             threshold = max(threshold, 0.05)
             k = RERANKER_TOP_K
 
-        filtered_docs = [d for d in retrieved_docs if d.get('retrieval_score', 0) >= threshold]
+        # Pinned email docs bypass threshold filtering (otherwise injection becomes useless).
+        def _is_pinned(d: Dict) -> bool:
+            return bool(d.get("id", "") and str(d.get("id", "")).startswith("email:"))
+
+        filtered_docs = [
+            d for d in retrieved_docs
+            if _is_pinned(d) or d.get('retrieval_score', 0) >= threshold
+        ]
         top_results = filtered_docs[:k]
 
         programme_reference_query = "\n".join(

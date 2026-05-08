@@ -310,6 +310,8 @@ class ChromaDBManager:
                     'email_requirements', 'email_links', 'email_subject', 'email_date',
                     'email_id', 'email_categorized_links', 'email_images',
                     'email_has_html',
+                    # added in 2026-05: structured event metadata
+                    'email_application_deadline', 'email_location', 'email_application_link',
                 ):
                     if doc_metadata.get(email_field):
                         chunk_metadata[email_field] = doc_metadata[email_field]

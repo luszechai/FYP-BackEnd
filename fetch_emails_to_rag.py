@@ -21,7 +21,10 @@ import imaplib
 import json
 import os
 import re
+import sqlite3
 import sys
+import time
+import random
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header as _decode_header_parts
@@ -57,6 +60,350 @@ _VALID_EMAIL_TYPES = {
     "Job Recruitment",
     "workshop",
 }
+
+_KIMI_CACHE_VERSION = "kimi_cache_v3"
+_KIMI_CACHE_DB_PATH = os.path.join(Config.CHROMA_DB_DIR, "kimi_extract_cache.sqlite3")
+
+_TPD_HINTS = (
+    "TPD rate limit",
+    "tokens per day",
+    "reached organization TPD rate limit",
+)
+
+
+def _is_tpd_limit_error(exc: Exception) -> bool:
+    s = str(exc)
+    lower = s.lower()
+    return any(h.lower() in lower for h in _TPD_HINTS)
+
+
+@contextmanager
+def _kimi_cache_conn():
+    os.makedirs(os.path.dirname(_KIMI_CACHE_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(_KIMI_CACHE_DB_PATH, timeout=30)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kimi_cache (
+                fingerprint TEXT PRIMARY KEY,
+                created_utc TEXT NOT NULL,
+                result_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        yield conn
+    finally:
+        conn.close()
+
+
+def _kimi_cache_get(fingerprint: str) -> Optional[Dict]:
+    try:
+        with _kimi_cache_conn() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM kimi_cache WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+            if not row:
+                return None
+            return json.loads(row[0])
+    except Exception:
+        print("⚠️ Kimi cache read failed; continuing without cache.")
+        return None
+
+
+def _kimi_cache_put(fingerprint: str, result: Dict) -> None:
+    try:
+        payload = json.dumps(result, ensure_ascii=False)
+        with _kimi_cache_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO kimi_cache (fingerprint, created_utc, result_json) VALUES (?, ?, ?)",
+                (fingerprint, datetime.now(timezone.utc).isoformat(), payload),
+            )
+            conn.commit()
+    except Exception:
+        # cache must never break ingestion
+        print("⚠️ Kimi cache write failed; continuing without cache.")
+        return
+
+
+def _normalize_text_for_llm(text: str) -> str:
+    if not text:
+        return ""
+    # Normalize newlines early for stable fingerprints
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Drop common quoted-reply separators and long footers
+    stop_markers = (
+        "-----Original Message-----",
+        "________________________________",
+        "Sent from my iPhone",
+        "Sent from my Android",
+        "Unsubscribe",
+        "unsubscribe",
+        "To unsubscribe",
+    )
+    lines: List[str] = []
+    all_lines = t.splitlines()
+    total = len(all_lines)
+    tail_start = max(0, total - 40)
+    for idx, line in enumerate(all_lines):
+        # Only treat unsubscribe/footer markers as terminators near the end.
+        if idx >= tail_start and any(m in line for m in stop_markers):
+            break
+        # Typical reply marker: "On ... wrote:"
+        if re.search(r"^On .{0,120}wrote:\s*$", line):
+            break
+        # Strip very long base64-ish junk lines
+        if len(line) > 4000 and re.fullmatch(r"[A-Za-z0-9+/=]+", line.strip() or "x"):
+            continue
+        lines.append(line)
+
+    t = "\n".join(lines)
+    # Collapse excessive whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t).strip()
+    return t
+
+
+def _truncate_for_llm(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 60] + "\n\n[TRUNCATED]\n"
+
+
+def _strip_jsonish_and_urls(text: str) -> str:
+    """Remove JSON-ish blobs / urls from extracted text fields."""
+    if not text:
+        return ""
+    t = _normalize_text_for_llm(text)
+    # Drop obvious dict/list fragments that sometimes leak from model output
+    t = re.sub(r"\[[^\]]*\burl\b[^\]]*\]", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\{[^}]*\burl\b[^}]*\}", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r'"\s*,\s*"\w+"\s*:\s*".*?"', " ", t, flags=re.IGNORECASE)
+    # Strip raw urls in requirements-like fields
+    t = re.sub(r"https?://[^\s)>\]]+", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,;\"'")
+    return t.strip()
+
+
+_URL_RE = re.compile(r"\b(https?://[^\s)>\]]+)", re.IGNORECASE)
+_DATE_ITEM_RE = re.compile(
+    r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b(?:\s*\([^)]+\))?",
+    re.IGNORECASE,
+)
+
+
+def _first_url(text: str) -> str:
+    if not text:
+        return ""
+    m = _URL_RE.search(text)
+    return (m.group(1) or "").strip() if m else ""
+
+
+def _tighten_deadline_snippet(s: str) -> str:
+    """Keep just the date-ish part plus a nearby time token if present."""
+    if not s:
+        return ""
+    t = _normalize_text_for_llm(s)
+    m = _DATEISH_RE.search(t)
+    if not m:
+        return t.strip().strip(" ,;\"'")
+    start, end = m.span()
+    date_part = t[start:end].strip()
+    tail = t[end : end + 24]
+    time_m = re.search(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", tail, flags=re.IGNORECASE)
+    if time_m:
+        return f"{date_part} {time_m.group(0).strip()}".strip()
+    # Chinese time tokens like "下午11時59分"
+    zh_time_m = re.search(r"(上午|下午)?\s*\d{1,2}\s*[時点]\s*\d{1,2}\s*分?", tail)
+    if zh_time_m:
+        return f"{date_part} {zh_time_m.group(0).strip()}".strip()
+    return date_part
+
+
+def _parse_various_deadlines(text: str) -> List[str]:
+    """
+    Parse lines like:
+      Various deadlines: 28 Apr 2026 (X), 29 Apr 2026 (Y) ...
+    into a list of items.
+    """
+    if not text:
+        return []
+    m = re.search(r"\bVarious deadlines?\s*[:\-]\s*(.+)$", text, flags=re.IGNORECASE)
+    if not m:
+        return []
+    body = m.group(1).strip()
+    if not body:
+        return []
+    parts = re.split(r",\s*(?=\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b)", body)
+    out: List[str] = []
+    for p in parts:
+        p = _normalize_text_for_llm(p).strip().strip(",")
+        if p:
+            out.append(p)
+    return out
+
+
+def _local_extract_event_fields(text: str, discovered_links: List[str], categorized_links: Optional[List[Dict]] = None) -> Dict[str, str]:
+    """
+    Rule-first extraction to reduce LLM usage.
+    Returns additive fields that won't break existing consumers.
+    """
+    t = _normalize_text_for_llm(text)
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+
+    # Deadline
+    deadlines = _parse_various_deadlines(joined)
+    if not deadlines:
+        m = re.search(
+            r"\b(?:deadline|apply by|application deadline|registration deadline)\s*[:\-]\s*([^\n]{4,160})",
+            joined,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            deadlines = [m.group(1).strip()]
+    if not deadlines:
+        # common phrasing without ':' e.g. "open ... until 16 July 23:59"
+        m = re.search(r"\buntil\s+([^\n]{3,80})", joined, flags=re.IGNORECASE)
+        if m and _DATEISH_RE.search(m.group(1) or ""):
+            deadlines = [m.group(1).strip()]
+    if not deadlines:
+        # "on or before 16 July 2026 (11:59 pm)"
+        m = re.search(r"\bon\s+or\s+before\s+([^\n]{3,80})", joined, flags=re.IGNORECASE)
+        if m and _DATEISH_RE.search(m.group(1) or ""):
+            deadlines = [m.group(1).strip()]
+    if not deadlines:
+        # Chinese: "...於7月16日下午11時59分截止..."
+        m = re.search(r"(?:於|至)\s*([^\n]{0,40}?\d{1,2}\s*月\s*\d{1,2}\s*[日號]?[^\n]{0,20}?)\s*(?:截止|前)", joined)
+        if m and _DATEISH_RE.search(m.group(1) or ""):
+            deadlines = [m.group(1).strip()]
+
+    # Filter obvious false positives like tail fragments of "accepted"
+    filtered: List[str] = []
+    for d in deadlines:
+        d = _normalize_text_for_llm(d).strip().strip(" ,;\"'")
+        if not d:
+            continue
+        if not _DATEISH_RE.search(d) and re.search(r"\baccepted\b", d, flags=re.IGNORECASE):
+            continue
+        if not _DATEISH_RE.search(d) and len(d) <= 6:
+            continue
+        filtered.append(_tighten_deadline_snippet(d))
+    deadlines = filtered
+    application_deadline = "; ".join(deadlines[:8]).strip()
+
+    # Period (event date range / date&time line)
+    event_period = ""
+    for key_re in (
+        r"\b(?:event|workshop|course)\s*(?:date|dates|time|period|duration)\s*[:\-]\s*([^\n.]{6,160})",
+        r"\b(?:date\s*&\s*time|date/time)\s*[:\-]\s*([^\n.]{6,160})",
+    ):
+        m = re.search(key_re, joined, flags=re.IGNORECASE)
+        if m and m.group(1):
+            cand = m.group(1).strip()
+            if "deadline" not in cand.lower():
+                event_period = cand
+                break
+    if not event_period:
+        # Date range "DD Mon YYYY - DD Mon YYYY"
+        m = re.search(
+            r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}[^.\n]{0,60})\s*(?:to|\-|–|—)\s*([^\n.]{6,80})",
+            joined,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            cand = f"{m.group(1).strip()} - {m.group(2).strip()}"
+            if "deadline" not in cand.lower():
+                event_period = cand
+
+    # Location (only explicit keys; avoid false positives)
+    location = ""
+    m = re.search(r"\b(?:location|venue|where)\s*[:\-]\s*([^\n.]{3,120})", joined, flags=re.IGNORECASE)
+    if m:
+        location = m.group(1).strip()
+
+    # Requirements: try explicit section; strip urls/jsonish
+    requirements = ""
+    m = re.search(r"\b(?:requirements?|eligibility|who can apply|criteria)\s*[:\-]\s*([^\n]{6,240})", joined, flags=re.IGNORECASE)
+    if m:
+        requirements = m.group(1).strip()
+    requirements = _strip_jsonish_and_urls(requirements)
+
+    # Application link: prefer categorized enrollment/info, else any discovered url
+    application_link = ""
+    if categorized_links:
+        for lk in categorized_links:
+            if isinstance(lk, dict) and lk.get("url"):
+                cat = (lk.get("category") or "").lower()
+                if cat in ("enrollment", "registration", "apply", "application"):
+                    application_link = lk["url"]
+                    break
+        if not application_link:
+            for lk in categorized_links:
+                if isinstance(lk, dict) and lk.get("url"):
+                    application_link = lk["url"]
+                    break
+    if not application_link:
+        # Score discovered links to avoid picking WhatsApp/mailto etc.
+        candidates = list(discovered_links or [])
+        if not candidates:
+            # fall back to urls in body text
+            candidates = [m.group(1) for m in _URL_RE.finditer(joined)]
+
+        def score(u: str) -> int:
+            s = u.lower()
+            sc = 0
+            if "mailto:" in s:
+                return -1000
+            if "whatsapp" in s:
+                sc -= 50
+            if any(k in s for k in ("apply", "application", "register", "registration", "enrol", "enroll", "forms", "/student")):
+                sc += 30
+            if any(k in s for k in ("linkreit.com", "hkcsssol.org.hk", "office.com", "microsoft.com")):
+                sc += 10
+            return sc
+
+        candidates = sorted({c.strip() for c in candidates if c and c.strip()}, key=score, reverse=True)
+        application_link = candidates[0] if candidates else ""
+
+    return {
+        "application_deadline": application_deadline,
+        "event_period": event_period,
+        "location": location,
+        "requirements": requirements,
+        "application_link": application_link,
+    }
+
+
+def _cheap_type_hint(subject: str, body: str, attachment_text: str) -> List[str]:
+    """Ultra-cheap local hinting to avoid LLM on low-value emails."""
+    s = f"{subject}\n{body}\n{attachment_text}".lower()
+    hits: List[str] = []
+    if any(k in s for k in ("scholarship", "scholarships", "獎學金")):
+        hits.append("scholarship")
+    if any(k in s for k in ("workshop", "seminar", "certificate", "course", "活動", "event")):
+        hits.append("workshop")
+    if any(k in s for k in ("career", "internship", "job", "recruit", "position", "vacancy", "招聘")):
+        hits.append("Job Recruitment")
+    if any(k in s for k in ("event", "events", "活動", "join us", "register")):
+        hits.append("events")
+    # de-dupe while preserving order
+    out: List[str] = []
+    for t in hits:
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def _should_call_llm(forced_types: List[str], hinted_types: List[str]) -> bool:
+    # Only do expensive extraction for these buckets
+    allow = {"events", "workshop", "Job Recruitment", "Member Recruitment", "scholarship"}
+    return any(t in allow for t in (forced_types or hinted_types))
 
 _CLASSIFICATION_SYSTEM_MESSAGE = (
     "You are processing university emails for a student information chatbot.\n\n"
@@ -228,9 +575,7 @@ def _get_body_from_message(msg: Message) -> str:
                     html = part.get_payload(decode=True).decode(
                         part.get_content_charset() or "utf-8", errors="ignore"
                     )
-                    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
-                    text = re.sub(r"<[^>]+>", " ", text)
-                    return re.sub(r"\s+", " ", text).strip()
+                    return _html_to_text(html)
                 except Exception:
                     continue
     else:
@@ -243,6 +588,51 @@ def _get_body_from_message(msg: Message) -> str:
                 return msg.get_payload()
 
     return ""
+
+
+def _html_to_text(html: str) -> str:
+    """Cheap HTML -> text converter (keeps basic structure + links)."""
+    if not html:
+        return ""
+    h = html
+    # Drop scripts/styles
+    h = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", h)
+    # Convert common block breaks to newlines
+    h = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", h)
+    h = re.sub(r"(?i)</\s*(p|div|tr|li|h[1-6])\s*>", "\n", h)
+    h = re.sub(r"(?i)<\s*(p|div|tr|li|h[1-6])\b[^>]*>", "", h)
+    # Table cells -> separator
+    h = re.sub(r"(?i)</\s*td\s*>", "\t", h)
+    h = re.sub(r"(?i)</\s*th\s*>", "\t", h)
+    # Preserve links: "text (url)"
+    def _a_repl(m):
+        href = (m.group(1) or "").strip()
+        text = re.sub(r"<[^>]+>", " ", m.group(2) or "")
+        text = _normalize_text_for_llm(text).strip()
+        href = href.strip()
+        if href and text and href not in text:
+            return f"{text} ({href})"
+        return text or href
+
+    h = re.sub(r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', _a_repl, h)
+    # Strip remaining tags
+    h = re.sub(r"(?s)<[^>]+>", " ", h)
+    # Decode common entities
+    h = (
+        h.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+    # Normalize whitespace but keep some newlines
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in h.splitlines()]
+    lines = [ln for ln in lines if ln]
+    text = "\n".join(lines)
+    # Collapse excessive newlines
+    text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+    return text
 
 
 def _iter_attachments(msg: Message) -> List[Tuple[str, bytes]]:
@@ -292,22 +682,95 @@ def _extract_inline_images(msg: Message) -> List[Tuple[str, str, bytes]]:
 
 
 def _create_kimi_llm() -> Optional[LLMProvider]:
-    """Create an LLMProvider instance for Kimi, if configured."""
-    if not Config.KIMI_API_KEY:
-        print("⚠️ KIMI_API_KEY not set – email bodies will be ingested without LLM processing.")
+    """Create an LLMProvider (with automatic failover), if configured.
+
+    Priority:
+      1) Kimi (Moonshot) if configured
+      2) DeepSeek if configured
+    """
+
+    class _FailoverLLM:
+        is_failover = True
+
+        def __init__(self, providers: List[LLMProvider]):
+            self.providers = providers
+
+        def _should_failover(self, exc: Exception) -> bool:
+            msg = str(exc).lower()
+            return _is_tpd_limit_error(exc) or ("429" in msg) or ("rate_limit" in msg)
+
+        def _call(self, fn_name: str, *args, **kwargs) -> str:
+            last_exc: Optional[Exception] = None
+            for idx, p in enumerate(self.providers):
+                try:
+                    fn = getattr(p, fn_name)
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    # Only fail over on quota/rate-limit style errors or unsupported feature.
+                    msg = str(e).lower()
+                    unsupported = "not supported" in msg or "unsupported" in msg
+                    if idx < len(self.providers) - 1 and (self._should_failover(e) or unsupported):
+                        continue
+                    raise
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("No LLM providers configured")
+
+        def generate_response(self, prompt: str, system_message: Optional[str] = None, **kwargs) -> str:
+            return self._call("generate_response", prompt=prompt, system_message=system_message, **kwargs)
+
+        def generate_response_with_images(
+            self,
+            prompt: str,
+            images: List[Tuple[bytes, str]],
+            system_message: Optional[str] = None,
+            **kwargs,
+        ) -> str:
+            return self._call(
+                "generate_response_with_images",
+                prompt=prompt,
+                images=images,
+                system_message=system_message,
+                **kwargs,
+            )
+
+    providers: List[LLMProvider] = []
+
+    if Config.KIMI_API_KEY:
+        providers.append(
+            LLMProvider(
+                provider="kimi",
+                api_key=Config.KIMI_API_KEY,
+                temperature=Config.LLM_TEMPERATURE,
+                max_tokens=4096,
+                enable_cache=Config.LLM_ENABLE_CACHE,
+                base_url=Config.KIMI_BASE_URL,
+                model=Config.KIMI_MODEL,
+                kimi_disable_thinking=Config.KIMI_DISABLE_THINKING,
+                request_timeout=Config.LLM_REQUEST_TIMEOUT,
+            )
+        )
+
+    if Config.DEEPSEEK_API_KEY:
+        providers.append(
+            LLMProvider(
+                provider="deepseek",
+                api_key=Config.DEEPSEEK_API_KEY,
+                temperature=Config.LLM_TEMPERATURE,
+                max_tokens=4096,
+                enable_cache=Config.LLM_ENABLE_CACHE,
+                base_url=Config.DEEPSEEK_BASE_URL,
+                model=Config.DEEPSEEK_MODEL,
+                request_timeout=Config.LLM_REQUEST_TIMEOUT,
+            )
+        )
+
+    if not providers:
+        print("⚠️ No LLM API key set (KIMI_API_KEY/DEEPSEEK_API_KEY) – ingesting without LLM extraction.")
         return None
 
-    return LLMProvider(
-        provider="kimi",
-        api_key=Config.KIMI_API_KEY,
-        temperature=Config.LLM_TEMPERATURE,
-        max_tokens=4096,
-        enable_cache=Config.LLM_ENABLE_CACHE,
-        base_url=Config.KIMI_BASE_URL,
-        model=Config.KIMI_MODEL,
-        kimi_disable_thinking=Config.KIMI_DISABLE_THINKING,
-        request_timeout=Config.LLM_REQUEST_TIMEOUT,
-    )
+    return providers[0] if len(providers) == 1 else _FailoverLLM(providers)
 
 
 @contextmanager
@@ -663,6 +1126,7 @@ def _process_email_with_kimi(
     subject: str,
     body: str,
     attachment_text: str,
+    html_body: Optional[str],
     image_attachments: List[Tuple[str, bytes]],
     discovered_links: List[str],
 ) -> Dict:
@@ -671,17 +1135,77 @@ def _process_email_with_kimi(
     a single combined document.  Falls back to raw concatenation when Kimi
     is unavailable.
     """
+    normalized_body_full = _normalize_text_for_llm(body)
+    normalized_html_full = _normalize_text_for_llm(_html_to_text(html_body or ""))
+    normalized_attachment_full = _normalize_text_for_llm(attachment_text)
+    # If plain text is too short (common for HTML-only/table emails), fall back to HTML-derived text.
+    effective_body = normalized_body_full
+    if len(effective_body.strip()) < 200:
+        effective_body = normalized_html_full or effective_body
+    cleaned_body = _truncate_for_llm(effective_body, max_chars=12000)
+    cleaned_attachment = _truncate_for_llm(normalized_attachment_full, max_chars=6000)
+
     parts: List[str] = [f"Subject: {subject}"]
-    if body.strip():
-        parts.append(f"Body:\n{body}")
-    if attachment_text.strip():
-        parts.append(f"Attachment text:\n{attachment_text}")
+    if cleaned_body.strip():
+        parts.append(f"Body:\n{cleaned_body}")
+    if normalized_html_full.strip() and len(normalized_body_full.strip()) < 200:
+        # Preserve that this was HTML-derived for debugging; keep it short.
+        parts.append("HTML (converted):\n" + _truncate_for_llm(normalized_html_full, max_chars=6000))
+    if cleaned_attachment.strip():
+        parts.append(f"Attachment text:\n{cleaned_attachment}")
     if discovered_links:
         parts.append("Links found in the email:\n" + "\n".join(discovered_links))
     prompt = "\n\n".join(parts)
 
+    local_fields = _local_extract_event_fields(prompt, discovered_links)
+
     fallback_links = [{"url": u, "category": "other"} for u in discovered_links]
     forced_types = _detect_forced_email_types(subject, body, attachment_text)
+    hinted_types = _cheap_type_hint(subject, cleaned_body, cleaned_attachment)
+    should_call_llm = _should_call_llm(forced_types, hinted_types)
+
+    image_sig = "|".join(
+        f"{name}:{len(payload)}:{hashlib.sha256(payload[:2048]).hexdigest()}"
+        for name, payload in (image_attachments or [])
+    )
+
+    fingerprint_src = "\n".join(
+        [
+            _KIMI_CACHE_VERSION,
+            subject.strip(),
+            effective_body.strip(),
+            normalized_attachment_full.strip(),
+            "\n".join(sorted(discovered_links or [])),
+            ",".join(forced_types or []),
+            image_sig,
+        ]
+    ).encode("utf-8", errors="ignore")
+    fingerprint = hashlib.sha256(fingerprint_src).hexdigest()
+
+    cached = _kimi_cache_get(fingerprint)
+    if cached:
+        cached_links = cached.get("links") or []
+        seen = set()
+        merged: List[Dict] = []
+        for lk in cached_links:
+            if isinstance(lk, dict) and "url" in lk:
+                u = lk["url"]
+                if u not in seen:
+                    merged.append({"url": u, "category": lk.get("category", "other")})
+                    seen.add(u)
+            elif isinstance(lk, str):
+                if lk not in seen:
+                    merged.append({"url": lk, "category": "other"})
+                    seen.add(lk)
+        for u in discovered_links or []:
+            if u not in seen:
+                merged.append({"url": u, "category": "other"})
+                seen.add(u)
+        cached["links"] = merged
+        if forced_types:
+            cached["types"] = forced_types
+            cached["type"] = forced_types[0]
+        return cached
     fallback_application_period = _extract_period_by_keywords(
         prompt, _APPLICATION_PERIOD_KEYWORDS,
     )
@@ -695,14 +1219,43 @@ def _process_email_with_kimi(
             "name": subject,
             "introduction": "",
             "application_period": fallback_application_period,
-            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else fallback_event_period,
+            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else (local_fields.get("event_period") or fallback_event_period),
             "details": "",
             "fees": "",
             "event_time": "",
-            "requirements": "",
+            "requirements": local_fields.get("requirements", ""),
+            "application_deadline": local_fields.get("application_deadline", ""),
+            "location": local_fields.get("location", ""),
+            "application_link": local_fields.get("application_link", ""),
             "links": fallback_links,
             "full_text": prompt,
         }
+
+    if not should_call_llm:
+        picked_types = forced_types or hinted_types
+        email_type = picked_types[0] if picked_types else ""
+        intro = ""
+        if cleaned_body.strip():
+            intro = cleaned_body.split("\n", 1)[0].strip()[:240]
+        result = {
+            "type": email_type,
+            "types": picked_types,
+            "name": subject,
+            "introduction": intro,
+            "application_period": fallback_application_period,
+            "event_period": "" if picked_types == _JOBS_EVENTS_TYPES else (local_fields.get("event_period") or fallback_event_period),
+            "details": "",
+            "fees": "",
+            "event_time": "",
+            "requirements": local_fields.get("requirements", ""),
+            "application_deadline": local_fields.get("application_deadline", ""),
+            "location": local_fields.get("location", ""),
+            "application_link": local_fields.get("application_link", ""),
+            "links": fallback_links,
+            "full_text": prompt,
+        }
+        _kimi_cache_put(fingerprint, result)
+        return result
 
     try:
         image_data: List[Tuple[bytes, str]] = []
@@ -712,17 +1265,36 @@ def _process_email_with_kimi(
             image_data.append((payload, mime))
             print(f"🖼️ Attaching image for Kimi vision: {filename}")
 
-        if image_data:
-            raw = llm.generate_response_with_images(
+        def _call_llm_once():
+            if image_data:
+                return llm.generate_response_with_images(
+                    prompt=prompt,
+                    images=image_data,
+                    system_message=_CLASSIFICATION_SYSTEM_MESSAGE,
+                )
+            return llm.generate_response(
                 prompt=prompt,
-                images=image_data,
                 system_message=_CLASSIFICATION_SYSTEM_MESSAGE,
             )
-        else:
-            raw = llm.generate_response(
-                prompt=prompt,
-                system_message=_CLASSIFICATION_SYSTEM_MESSAGE,
-            )
+
+        raw = None
+        last_exc: Optional[Exception] = None
+        for attempt in range(6):
+            try:
+                raw = _call_llm_once()
+                break
+            except Exception as e:
+                last_exc = e
+                if _is_tpd_limit_error(e) and not getattr(llm, "is_failover", False):
+                    raise SystemExit(f"TPD exceeded; stop and rerun after reset.\n{e}")
+                msg = str(e).lower()
+                if "429" in msg or "rate_limit" in msg:
+                    sleep_s = min(60.0, (2.0 ** attempt) + random.random())
+                    time.sleep(sleep_s)
+                    continue
+                raise
+        if raw is None and last_exc is not None:
+            raise last_exc
 
         cleaned = raw.strip()
         if cleaned.startswith("```"):
@@ -766,7 +1338,10 @@ def _process_email_with_kimi(
             )
         event_time = result.get("event_time", "") or result.get("time", "")
         email_types = _resolve_email_types(result, forced_types)
-        return {
+        local_from_links = _local_extract_event_fields(full_text, discovered_links, categorized_links=categorized)
+        requirements = _strip_jsonish_and_urls(result.get("requirements", "")) or local_from_links.get("requirements") or local_fields.get("requirements", "")
+        application_link = local_from_links.get("application_link") or local_fields.get("application_link", "")
+        final = {
             "type": email_types[0] if email_types else result.get("type", ""),
             "types": email_types,
             "name": result.get("name", ""),
@@ -776,16 +1351,21 @@ def _process_email_with_kimi(
             "details": result.get("details", ""),
             "fees": result.get("fees", ""),
             "event_time": event_time,
-            "requirements": result.get("requirements", ""),
+            "requirements": requirements,
+            "application_deadline": local_from_links.get("application_deadline") or local_fields.get("application_deadline", ""),
+            "location": local_from_links.get("location") or local_fields.get("location", ""),
+            "application_link": application_link,
             "links": categorized,
             "full_text": full_text,
         }
+        _kimi_cache_put(fingerprint, final)
+        return final
 
     except json.JSONDecodeError:
         print("⚠️ Kimi did not return valid JSON; using raw response as full_text.")
         email_type = forced_types[0] if forced_types else ""
         raw_full_text = _extract_json_string_field(raw, ("full_text",)) or raw
-        return {
+        final = {
             "type": email_type,
             "types": forced_types,
             "name": subject,
@@ -811,27 +1391,39 @@ def _process_email_with_kimi(
             "details": "",
             "fees": "",
             "event_time": "",
-            "requirements": "",
+            "requirements": local_fields.get("requirements", ""),
+            "application_deadline": local_fields.get("application_deadline", ""),
+            "location": local_fields.get("location", ""),
+            "application_link": local_fields.get("application_link", ""),
             "links": fallback_links,
             "full_text": raw,
         }
+        _kimi_cache_put(fingerprint, final)
+        return final
     except Exception as e:
+        if _is_tpd_limit_error(e):
+            raise SystemExit(f"TPD exceeded; stop and rerun after reset.\n{e}")
         print(f"⚠️ Kimi processing failed: {e}")
         email_type = forced_types[0] if forced_types else ""
-        return {
+        final = {
             "type": email_type,
             "types": forced_types,
             "name": subject,
             "introduction": "",
             "application_period": fallback_application_period,
-            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else fallback_event_period,
+            "event_period": "" if forced_types == _JOBS_EVENTS_TYPES else (local_fields.get("event_period") or fallback_event_period),
             "details": "",
             "fees": "",
             "event_time": "",
-            "requirements": "",
+            "requirements": local_fields.get("requirements", ""),
+            "application_deadline": local_fields.get("application_deadline", ""),
+            "location": local_fields.get("location", ""),
+            "application_link": local_fields.get("application_link", ""),
             "links": fallback_links,
             "full_text": prompt,
         }
+        _kimi_cache_put(fingerprint, final)
+        return final
 
 
 def _build_document_content(info: Dict) -> str:
@@ -958,7 +1550,7 @@ def fetch_and_ingest_emails():
 
             info = _process_email_with_kimi(
                 llm, subject, body_text, attachment_text,
-                image_attachments, discovered_links,
+                html_body, image_attachments, discovered_links,
             )
 
             category_types = info.get("types") or []
@@ -1001,6 +1593,9 @@ def fetch_and_ingest_emails():
                         "email_event_time": event_time,
                         "email_time": event_time,
                         "email_requirements": info.get("requirements", ""),
+                        "email_application_deadline": info.get("application_deadline", ""),
+                        "email_location": info.get("location", ""),
+                        "email_application_link": info.get("application_link", ""),
                         "email_links": flat_links_str,
                         "email_subject": subject,
                         "email_date": date_header,
