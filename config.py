@@ -23,6 +23,10 @@ class Config:
     KIMI_MODEL: str = "kimi-k2.5"
     # For kimi-k2.5: thinking mode uses temperature 1.0; non-thinking uses 0.6. Set False to allow temperature 0.6.
     KIMI_DISABLE_THINKING: bool = os.getenv("KIMI_DISABLE_THINKING", "true").lower() in ("true", "1", "yes")
+
+    # Ragas eval uses Kimi; Moonshot org limits concurrent requests (often 3). Keep defaults below that.
+    RAGAS_EVAL_MAX_WORKERS: int = max(1, int(os.getenv("RAGAS_EVAL_MAX_WORKERS", "2")))
+    RAGAS_KIMI_MAX_CONCURRENT: int = max(1, int(os.getenv("RAGAS_KIMI_MAX_CONCURRENT", "2")))
     
     # LLM Settings
     LLM_TEMPERATURE: float = 0.6
