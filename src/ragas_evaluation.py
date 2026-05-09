@@ -7,7 +7,6 @@ against them, computing Ragas metrics, and formatting results.
 Used by both the standalone run_ragas_evaluation.py script and the
 /api/ragas/* API endpoints.
 """
-import asyncio
 import hashlib
 import json
 import math
@@ -28,7 +27,7 @@ from ragas.metrics import (
 from ragas.run_config import RunConfig
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from config import Config
@@ -224,34 +223,15 @@ def run_pipeline_on_testset(
 # 3. Evaluate with Ragas
 # ---------------------------------------------------------------------------
 
-class _ConcurrencyLimitedChatOpenAI(ChatOpenAI):
-    """Caps simultaneous async Kimi calls — Ragas defaults to high parallelism and triggers org 429s."""
-
-    def __init__(self, *args, max_concurrent: int = 2, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._sem = asyncio.Semaphore(max_concurrent)
-
-    async def agenerate_prompt(self, prompts, stop=None, callbacks=None, **kwargs):
-        async with self._sem:
-            return await super().agenerate_prompt(
-                prompts, stop=stop, callbacks=callbacks, **kwargs
-            )
-
-
 def _get_ragas_llm() -> LangchainLLMWrapper:
-    """Create a LangchainLLMWrapper around Kimi for Ragas metric computation."""
-    llm = _ConcurrencyLimitedChatOpenAI(
-        model=Config.KIMI_MODEL,
-        base_url=Config.KIMI_BASE_URL,
-        api_key=Config.KIMI_API_KEY,
-        temperature=0.6,
-        max_tokens=4096,
-        max_concurrent=Config.RAGAS_KIMI_MAX_CONCURRENT,
-        model_kwargs={
-            "extra_body": {"thinking": {"type": "disabled"}},
-        } if Config.KIMI_DISABLE_THINKING else {},
+    """Create a LangchainLLMWrapper around Gemini for Ragas metric computation."""
+    llm = ChatGoogleGenerativeAI(
+        model=Config.GEMINI_MODEL,
+        google_api_key=Config.GEMINI_API_KEY,
+        temperature=0.0,
+        max_output_tokens=16384,
     )
-    return LangchainLLMWrapper(llm, bypass_temperature=True)
+    return LangchainLLMWrapper(llm)
 
 
 def _get_ragas_embeddings() -> LangchainEmbeddingsWrapper:
@@ -312,7 +292,7 @@ def evaluate_with_ragas(pipeline_results: List[Dict]) -> Dict:
         run_config=RunConfig(
             timeout=180,
             max_retries=6,
-            max_wait=90,
+            max_wait=180,
             max_workers=Config.RAGAS_EVAL_MAX_WORKERS,
         ),
     )

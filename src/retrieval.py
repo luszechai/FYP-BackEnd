@@ -245,6 +245,14 @@ class HybridRetriever:
                 )
                 # Fuse vector + BM25 rankings with RRF
                 fused = reciprocal_rank_fusion([vector_ranking, bm25_results], k=60)
+                # RRF scores are tiny (max ≈ 1/61 ≈ 0.016 per list).  Normalise
+                # to [0, 1] so they survive the similarity threshold filter in
+                # chatbot.py (default 0.1) without changing the relative ranking.
+                if fused:
+                    max_rrf = max(d.get('retrieval_score', 0) for d in fused)
+                    if max_rrf > 0:
+                        for d in fused:
+                            d['retrieval_score'] = d['retrieval_score'] / max_rrf
                 all_results = {doc['id']: doc for doc in fused}
         elif self.use_hybrid:
             # Assign retrieval_score for documents that may only have similarity.
