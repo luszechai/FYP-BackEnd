@@ -5,6 +5,7 @@ Scrapes the sitemap and recursively crawls pages up to the specified depth.
 """
 
 import asyncio
+import html as html_module
 import json
 import os
 import re
@@ -29,6 +30,50 @@ from config import Config
 
 # All output files go to FYP-BackEnd/output
 OUTPUT_DIR = os.path.join(_project_root, "output")
+
+
+def _fetch_page_with_crawl4ai(url: str) -> Optional[str]:
+    """Fetch HTML using Crawl4AI (headless browser). ThreadPoolExecutor-safe (new loop per call).
+
+    https://docs.crawl4ai.com/ — requires: pip install crawl4ai && python -m playwright install chromium
+    """
+    try:
+        from crawl4ai import AsyncWebCrawler
+    except ImportError:
+        print("⚠️ crawl4ai not installed. pip install crawl4ai && python -m playwright install chromium")
+        return None
+
+    async def _arun() -> Optional[str]:
+        async with AsyncWebCrawler() as crawler:
+            result = await crawler.arun(url=url)
+            if getattr(result, "success", True) is False:
+                return None
+            html = getattr(result, "html", None) or getattr(result, "cleaned_html", None) or ""
+            if html and len(html) > 100:
+                return html
+            md = getattr(result, "markdown", None) or ""
+            if md:
+                esc = html_module.escape(md)
+                return (
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>crawl4ai</title></head>"
+                    f"<body><pre>{esc}</pre></body></html>"
+                )
+            return None
+
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(_arun())
+    except Exception as e:
+        print(f"⚠️ Crawl4AI fetch failed for {url[:80]}...: {e}")
+        return None
+    finally:
+        try:
+            if loop is not None and not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -64,7 +109,13 @@ class PageContent:
 class SFUSitemapScraper:
     """Scraper for SFU sitemap with true recursive depth crawling"""
     
-    def __init__(self, max_workers: int = 10, request_delay: float = 0.1, max_pages: int = 5000):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        request_delay: float = 0.1,
+        max_pages: int = 5000,
+        use_crawl4ai: Optional[bool] = None,
+    ):
         self.base_url = "https://www.sfu.edu.hk"
         self.sitemap_url = "https://www.sfu.edu.hk/en/site-map/index.html"
         self.items: List[SitemapItem] = []
@@ -72,12 +123,18 @@ class SFUSitemapScraper:
         self.max_workers = max_workers
         self.request_delay = request_delay
         self.max_pages = max_pages  # Safety limit to prevent infinite crawling
+        if use_crawl4ai is None:
+            self.use_crawl4ai = bool(getattr(Config, "USE_CRAWL4AI", False))
+        else:
+            self.use_crawl4ai = bool(use_crawl4ai)
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         })
+        if self.use_crawl4ai:
+            print("🌐 Crawl4AI enabled for page fetches (browser). Fallback: requests if a page fails.")
         # Track visited URLs across all depths
         self.visited_urls: Set[str] = set()
         self.all_crawled_pages: List[Dict[str, Any]] = []
@@ -141,6 +198,11 @@ class SFUSitemapScraper:
 
     def fetch_page(self, url: str) -> Optional[str]:
         """Fetch page content with error handling. Returns None if response is not HTML."""
+        if self.use_crawl4ai:
+            html = _fetch_page_with_crawl4ai(url)
+            if html:
+                return html
+            # Fall back to HTTP if browser fetch failed
         try:
             response = self.session.get(url, timeout=30, allow_redirects=True)
             response.raise_for_status()
@@ -1034,10 +1096,19 @@ async def main():
     parser.add_argument('--workers', type=int, default=10, help='Number of concurrent workers')
     parser.add_argument('--max-pages', type=int, default=5000, help='Maximum pages to crawl (safety limit)')
     parser.add_argument('--no-ai', action='store_true', help='Skip AI refinement')
+    parser.add_argument(
+        '--crawl4ai',
+        action='store_true',
+        help='Use Crawl4AI (headless browser) for page fetches (overrides USE_CRAWL4AI env)',
+    )
     args = parser.parse_args()
     
     # Step 1: Scrape the sitemap with depth crawling
-    scraper = SFUSitemapScraper(max_workers=args.workers, max_pages=args.max_pages)
+    scraper = SFUSitemapScraper(
+        max_workers=args.workers,
+        max_pages=args.max_pages,
+        use_crawl4ai=True if args.crawl4ai else None,
+    )
     raw_data = scraper.scrape(crawl_depth=args.depth)
     
     if not raw_data:

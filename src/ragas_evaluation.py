@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional
 
 from ragas import evaluate
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
-from ragas.metrics import (
+from ragas.metrics.collections import (
     AnswerRelevancy,
     ContextPrecision,
     ContextRecall,

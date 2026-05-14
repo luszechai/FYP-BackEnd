@@ -69,6 +69,10 @@ class Config:
     
     # Source URL Configuration
     SOURCE_BASE_URL: str = os.getenv("SOURCE_BASE_URL", "https://www.sfu.edu.hk")
+
+    # Web crawler: use Crawl4AI (headless browser) for page fetches — https://docs.crawl4ai.com/
+    # After pip install: python -m playwright install chromium
+    USE_CRAWL4AI: bool = os.getenv("USE_CRAWL4AI", "false").lower() in ("true", "1", "yes")
     
     # RBS Booking Portal
     RBS_BOOKING_URL: str = os.getenv("RBS_BOOKING_URL", "https://rbs.cihe.edu.hk")
