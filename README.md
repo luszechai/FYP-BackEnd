@@ -32,11 +32,10 @@ python src/web_crawler.py --depth 4 --crawl4ai
 
 - `--crawl4ai` forces Crawl4AI (headless browser) for HTML fetches; install with `pip install crawl4ai` and `python -m playwright install chromium` (see `config.py` / crawler logs if deps are missing).
 - Raw crawl is written to **`output/sfu_sitemap_depth3_raw.json`**. With default AI refinement (omit `--no-ai`), a refined bundle is written to **`output/sfu_sitemap_depth3_refined.json`**.
-- Those files are **crawl bundles** (`crawled_pages` on raw, or `raw_crawled_data` on refined), not the ingest shape below. Convert them with **`scripts/crawl_to_merged_rag.py`** (repo root):
+- Those files are **crawl bundles** (`crawled_pages` on raw, or `raw_crawled_data` on refined), not the ingest shape below. Convert them with **`ingest_refined_sitemap.py`** (repo root):
 
 ```bash
-python scripts/crawl_to_merged_rag.py -i output/sfu_sitemap_depth3_refined.json -o merged_rag_data.json
-# or: -i output/sfu_sitemap_depth3_refined.json  (uses raw_crawled_data; do not use the AI "pages" list for RAG text)
+python ingest_refined_sitemap.py -i output/sfu_sitemap_depth3_refined.json -o merged_rag_data.json
 ```
 
 **Load into Chroma** — `api_server.py` / `main.py` call `add_documents_from_json` **only when the Chroma collection is empty**. After updating `merged_rag_data.json` (or your `DATA_FILE` path): stop the server, **delete `./chroma_db`** (or wipe the target collection), then start again so chunks are rebuilt from the new JSON.
@@ -72,7 +71,7 @@ python main.py
 python api_server.py
 ```
 
-`python api_server.py` uses `uvicorn.run(..., port=8001)` at the bottom of `api_server.py`, so it listens on **8001** by default. If you start with `uvicorn api_server:app --port <N>`, **the CLI `--port` wins** and may differ from the script entrypoint. Full routes and request bodies: [`README_API.md`](./README_API.md).
+`python api_server.py` uses `uvicorn.run(..., port=8000)` at the bottom of `api_server.py`, so it listens on **8000** by default. If you start with `uvicorn api_server:app --port <N>`, **the CLI `--port` wins** and may differ from the script entrypoint. Full routes and request bodies: [`README_API.md`](./README_API.md).
 
 ## Features
 
@@ -94,7 +93,7 @@ FYP-BackEnd/
 ├── generate_testset.py      # Build / refresh eval_testset.json
 ├── run_ragas_evaluation.py  # CLI Ragas helper (legacy file output)
 ├── scripts/
-│   └── crawl_to_merged_rag.py  # output/*_raw.json or refined → merged_rag_data.json
+│   └── ingest_refined_sitemap.py  # output/*_raw.json or refined → merged_rag_data.json
 ├── output/                  # Crawler writes sfu_sitemap_depth{N}_*.json here
 ├── merged_rag_data.json     # Default DATA_FILE: root `documents` list for Chroma ingest
 ├── eval_testset.json        # Ragas question set
