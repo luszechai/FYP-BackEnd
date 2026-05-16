@@ -1028,7 +1028,9 @@ class DataRefiner:
             
             # Merge with original data
             refined_data['raw_crawled_data'] = raw_data.get('crawled_pages', [])
-            
+            # LLM JSON follows a template with "scraped_date" / no crawl_depth — do not trust those for facts.
+            self._merge_scrape_provenance(refined_data, raw_data)
+
             print("✅ AI refinement complete!")
             return refined_data
             
@@ -1036,6 +1038,22 @@ class DataRefiner:
             print(f"⚠️ AI refinement failed: {e}")
             print("Falling back to basic refinement...")
             return self.basic_refinement(raw_data)
+
+    @staticmethod
+    def _merge_scrape_provenance(target: Dict[str, Any], raw_data: Dict[str, Any]) -> None:
+        """Copy ground-truth fields from scrape() into refined JSON (LLM output omits or hallucinates them)."""
+        if raw_data.get("crawl_depth") is not None:
+            target["crawl_depth"] = raw_data["crawl_depth"]
+        if raw_data.get("scraped_date"):
+            target["scraped_date"] = raw_data["scraped_date"]
+        if raw_data.get("crawl_stats") is not None:
+            target["crawl_stats"] = raw_data["crawl_stats"]
+        if raw_data.get("statistics") is not None:
+            target["statistics"] = raw_data["statistics"]
+        if raw_data.get("sitemap_url"):
+            target["sitemap_url"] = raw_data["sitemap_url"]
+        if raw_data.get("university"):
+            target["university"] = raw_data["university"]
     
     def basic_refinement(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
         """Basic refinement without AI"""
@@ -1088,6 +1106,22 @@ class DataRefiner:
         return output_path
 
 
+def _effective_crawl_depth(data: Dict[str, Any]) -> int:
+    """Top-level crawl_depth, or max per-page depth (fixes legacy AI-refined JSON missing the field)."""
+    explicit = data.get("crawl_depth")
+    pages = data.get("raw_crawled_data") or data.get("crawled_pages") or data.get("all_pages") or []
+    depths = [int(p.get("content", {}).get("crawl_depth") or 0) for p in pages if isinstance(p, dict)]
+    inferred_max = max(depths) if depths else None
+    if explicit is not None:
+        ex = int(explicit)
+        if ex == 0 and inferred_max is not None and inferred_max > 0:
+            return inferred_max
+        return ex
+    if inferred_max is not None:
+        return inferred_max
+    return 0
+
+
 def print_summary(data: Dict[str, Any]):
     """Print a summary of the data"""
     print("\n" + "="*60)
@@ -1096,7 +1130,7 @@ def print_summary(data: Dict[str, Any]):
     
     print(f"🏫 University: {data.get('university', 'N/A')}")
     print(f"📅 Scraped Date: {data.get('scraped_date', 'N/A')}")
-    print(f"🔍 Crawl Depth: {data.get('crawl_depth', 0)}")
+    print(f"🔍 Crawl Depth: {_effective_crawl_depth(data)}")
     
     if "crawl_stats" in data:
         stats = data["crawl_stats"]

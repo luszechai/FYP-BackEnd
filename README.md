@@ -12,11 +12,7 @@ pip install -r requirements.txt
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the project root:
-
-```bash
-cp .env.example .env
-```
+Create a `.env` file in the project root (this repo may not ship `.env.example`; names must match `config.py`).
 
 Edit `.env` and add your DeepSeek API key:
 
@@ -26,11 +22,26 @@ DEEPSEEK_API_KEY=your_actual_api_key_here
 
 **Important:** Never commit your `.env` file to Git! It's already in `.gitignore`.
 
-### 3. Prepare Data File
+### 3. Prepare data
 
-Place your `merged_rag_data.json` file in the project root directory.
+**Site crawl (current dataset recipe)** — from the repo root, regenerate the sitemap crawl with depth **3** and Crawl4AI-backed fetches:
 
-The JSON file should have the following structure:
+```bash
+python src/web_crawler.py --depth 4 --crawl4ai
+```
+
+- `--crawl4ai` forces Crawl4AI (headless browser) for HTML fetches; install with `pip install crawl4ai` and `python -m playwright install chromium` (see `config.py` / crawler logs if deps are missing).
+- Raw crawl is written to **`output/sfu_sitemap_depth3_raw.json`**. With default AI refinement (omit `--no-ai`), a refined bundle is written to **`output/sfu_sitemap_depth3_refined.json`**.
+- Those files are **crawl bundles** (`crawled_pages` on raw, or `raw_crawled_data` on refined), not the ingest shape below. Convert them with **`scripts/crawl_to_merged_rag.py`** (repo root):
+
+```bash
+python scripts/crawl_to_merged_rag.py -i output/sfu_sitemap_depth3_refined.json -o merged_rag_data.json
+# or: -i output/sfu_sitemap_depth3_refined.json  (uses raw_crawled_data; do not use the AI "pages" list for RAG text)
+```
+
+**Load into Chroma** — `api_server.py` / `main.py` call `add_documents_from_json` **only when the Chroma collection is empty**. After updating `merged_rag_data.json` (or your `DATA_FILE` path): stop the server, **delete `./chroma_db`** (or wipe the target collection), then start again so chunks are rebuilt from the new JSON.
+
+**Chroma ingest format** — whatever file `DATA_FILE` points to (by default `merged_rag_data.json` in the project root) must follow this structure for `ChromaDBManager.add_documents_from_json`:
 
 ```json
 {
@@ -61,7 +72,7 @@ python main.py
 python api_server.py
 ```
 
-The bundled `python api_server.py` entrypoint listens on **port 8001**. For uvicorn options and full route list see [`README_API.md`](./README_API.md).
+`python api_server.py` uses `uvicorn.run(..., port=8001)` at the bottom of `api_server.py`, so it listens on **8001** by default. If you start with `uvicorn api_server:app --port <N>`, **the CLI `--port` wins** and may differ from the script entrypoint. Full routes and request bodies: [`README_API.md`](./README_API.md).
 
 ## Features
 
@@ -82,7 +93,10 @@ FYP-BackEnd/
 ├── fetch_emails_to_rag.py   # Optional: IMAP → Chroma email chunks
 ├── generate_testset.py      # Build / refresh eval_testset.json
 ├── run_ragas_evaluation.py  # CLI Ragas helper (legacy file output)
-├── merged_rag_data.json     # Primary knowledge JSON (root `documents` list)
+├── scripts/
+│   └── crawl_to_merged_rag.py  # output/*_raw.json or refined → merged_rag_data.json
+├── output/                  # Crawler writes sfu_sitemap_depth{N}_*.json here
+├── merged_rag_data.json     # Default DATA_FILE: root `documents` list for Chroma ingest
 ├── eval_testset.json        # Ragas question set
 ├── eval_runs/               # Saved per-dashboard evaluation runs (JSON)
 ├── chroma_db/               # Persistent Chroma store (local, not always in git)
@@ -93,7 +107,7 @@ FYP-BackEnd/
     ├── bm25_search.py       # Sparse index over Chroma documents
     ├── reranker.py          # Cross-encoder reranking
     ├── vector_db.py         # ChromaDB + chunking / ingest from JSON
-    ├── web_crawler.py       # Sitemap crawl → JSON (separate from API ingest)
+    ├── web_crawler.py       # CLI: e.g. --depth 3 --crawl4ai → output/sfu_sitemap_depth*.json
     ├── query_enhancer.py    # Query-type detection + expansions
     ├── query_rewriter.py    # LLM rewrite for retrieval
     ├── adaptive_config.py   # Dynamic retrieval / token / memory knobs
@@ -128,26 +142,30 @@ loaded ChromaDB index. Each click in the dashboard produces two saved runs —
 an **all-off Baseline** and a user-selected **Optimized** run — so the panel
 can be compared side-by-side.
 
-### Endpoints
+### Endpoints (subset)
 
-| Method | Path                          | Description                                                                                     |
-| ------ | ----------------------------- | ----------------------------------------------------------------------------------------------- |
-| GET    | `/api/ragas/testset`          | Testset metadata (total questions, category breakdown, sample questions).                       |
-| POST   | `/api/ragas/run`              | Run one evaluation with explicit strategy toggles. Blocks until complete, returns full run doc. |
-| POST   | `/api/ragas/run/stream`       | SSE variant of `/api/ragas/run` — streams per-question progress then a final `run_saved` event. |
-| GET    | `/api/ragas/runs`             | List summaries of every saved run, newest first (no per-question detail).                       |
-| GET    | `/api/ragas/runs/{run_id}`    | Full saved run (strategies + aggregate + per-question retrieval, answer, and metric scores).    |
+Common paths for the evaluation dashboard; **full HTTP list and field reference**: [`README_API.md`](./README_API.md).
 
-Legacy endpoints (`/api/ragas/evaluate`, `/api/ragas/results`) remain in
-place for backward compatibility with `run_ragas_evaluation.py`.
+| Method | Path                       | Description |
+| ------ | -------------------------- | ----------- |
+| GET    | `/api/ragas/testset`       | Test set metadata (counts, categories, sample questions). |
+| POST   | `/api/ragas/run`           | One-shot eval; blocks until done; returns full run document. |
+| POST   | `/api/ragas/run/stream`    | Same logic; SSE progress; final `run_saved` event. |
+| GET    | `/api/ragas/runs`          | List summaries of saved runs (no per-question detail). |
+| GET    | `/api/ragas/runs/{run_id}` | Full run (strategies, aggregate, per-question retrieval/answer/metrics). |
 
-### Request body for `/api/ragas/run{,/stream}`
+Legacy file/CLI flow: `POST /api/ragas/evaluate`, `GET /api/ragas/results` (**query** parameters, not an `EvalRunRequest` JSON body; aligns with `run_ragas_evaluation.py`, etc.). Parameter table: [`README_API.md`](./README_API.md).
+
+### Request body for `/api/ragas/run` and `/api/ragas/run/stream` (fields as in code)
+
+Matches `EvalRunRequest` / `EvalStrategies`. Every boolean in `strategies` **defaults to `false`** in code (empty body = baseline all-off). Example below turns **all** on for illustration.
 
 ```json
 {
   "label": "my_optional_run_label",
   "max_questions": 10,
   "testset_path": "eval_testset.json",
+  "provider": "deepseek",
   "strategies": {
     "use_reranker": true,
     "use_adaptive": true,
@@ -159,10 +177,7 @@ place for backward compatibility with `run_ragas_evaluation.py`.
 }
 ```
 
-Each strategy is query-time only, so toggling them does **not** require
-re-ingesting ChromaDB. The `/api/chat` singleton is unaffected — evaluation
-runs build a transient `RAGChatbot` that shares the already-loaded
-ChromaDB, LLM provider, and (if enabled) reranker.
+Toggles apply only to the **evaluation** query path; you do **not** need to re-ingest Chroma when switching them. The `/api/chat` singleton is unchanged; evaluation builds a **temporary** `RAGChatbot` reusing the loaded Chroma, LLM, and (if enabled) reranker.
 
 ### Run storage format
 
@@ -182,13 +197,13 @@ immediately; otherwise run one baseline + one optimized evaluation from the UI.
 ### Chunking / dataset A/B workflow
 
 Chunking decisions happen in `src/vector_db.py` (e.g. `RecursiveCharacterTextSplitter`
-chunk size / overlap) and in the contents of `merged_rag_data.json`, not in the
-dashboard. Ingestion path: on startup, **`main.py` and `api_server.py` both load
-from `merged_rag_data.json` only when the Chroma collection is empty** (see
+chunk size / overlap) and in the contents of the ingest JSON (`merged_rag_data.json` or your `DATA_FILE`), not in the
+dashboard. Site HTML is produced separately by `src/web_crawler.py` (e.g. `--depth 3 --crawl4ai`). Ingestion path: on startup, **`main.py` and `api_server.py` both load
+from `Config.DATA_FILE` (default `merged_rag_data.json`) only when the Chroma collection is empty** (see
 `ChromaDBManager.add_documents_from_json`). To compare two chunking or dataset
 variants:
 
-1. Point `merged_rag_data.json` (and/or edit chunking constants in
+1. Point your ingest JSON (`merged_rag_data.json` or `DATA_FILE` in `config.py`) (and/or edit chunking constants in
    `src/vector_db.py`) to variant **A**.
 2. **Rebuild Chroma** so the collection is empty on next boot: stop any running
    server, delete the `./chroma_db` directory (or remove only the target
@@ -224,6 +239,7 @@ selected runs have different `testset_hash` values.
 ## Troubleshooting
 
 - **"DEEPSEEK_API_KEY is not set"**: Make sure you've created a `.env` file with your API key
-- **"merged_rag_data.json not found"**: Place your data file in the project root
+- **`merged_rag_data.json` not found** (or wrong `DATA_FILE`): place that file at the project root (default name `merged_rag_data.json`) or change `DATA_FILE` in `config.py` to a JSON with a top-level `documents` array
+- **Chat still answers from old facts**: you updated JSON but Chroma was already populated — delete `./chroma_db` and restart so the empty collection re-ingests `DATA_FILE`
 - **Import errors**: Make sure all dependencies are installed: `pip install -r requirements.txt`
 
