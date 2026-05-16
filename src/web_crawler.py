@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Set
 from dataclasses import dataclass, asdict, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from urllib.parse import urljoin, urlparse
 
 # Project root on path for config
@@ -31,16 +32,27 @@ from config import Config
 # All output files go to FYP-BackEnd/output
 OUTPUT_DIR = os.path.join(_project_root, "output")
 
+# Dedicated thread pool for Crawl4AI (each fetch runs in a thread with its own event loop).
+_crawl4ai_executor: Optional[ThreadPoolExecutor] = None
+_crawl4ai_executor_lock = threading.Lock()
 
-def _fetch_page_with_crawl4ai(url: str) -> Optional[str]:
-    """Fetch HTML using Crawl4AI (headless browser). ThreadPoolExecutor-safe (new loop per call).
 
-    https://docs.crawl4ai.com/ — requires: pip install crawl4ai && python -m playwright install chromium
-    """
+def _get_crawl4ai_executor() -> ThreadPoolExecutor:
+    global _crawl4ai_executor
+    with _crawl4ai_executor_lock:
+        if _crawl4ai_executor is None:
+            _crawl4ai_executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="crawl4ai",
+            )
+        return _crawl4ai_executor
+
+
+def _run_crawl4ai_sync_on_thread(url: str) -> Optional[str]:
+    """Run Crawl4AI in a thread that has no running asyncio loop (safe under asyncio.run(main()))."""
     try:
         from crawl4ai import AsyncWebCrawler
     except ImportError:
-        print("⚠️ crawl4ai not installed. pip install crawl4ai && python -m playwright install chromium")
         return None
 
     async def _arun() -> Optional[str]:
@@ -60,20 +72,35 @@ def _fetch_page_with_crawl4ai(url: str) -> Optional[str]:
                 )
             return None
 
-    loop = None
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(_arun())
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+        asyncio.set_event_loop(None)
+
+
+def _fetch_page_with_crawl4ai(url: str, timeout: float = 180.0) -> Optional[str]:
+    """Fetch HTML using Crawl4AI. Always runs in a worker thread to avoid 'loop already running'.
+
+    https://docs.crawl4ai.com/ — requires: pip install crawl4ai && python -m playwright install chromium
+    """
+    try:
+        from crawl4ai import AsyncWebCrawler  # noqa: F401 — verify installed before submit
+    except ImportError:
+        print("⚠️ crawl4ai not installed. pip install crawl4ai && python -m playwright install chromium")
+        return None
+
+    try:
+        future = _get_crawl4ai_executor().submit(_run_crawl4ai_sync_on_thread, url)
+        return future.result(timeout=timeout)
     except Exception as e:
         print(f"⚠️ Crawl4AI fetch failed for {url[:80]}...: {e}")
         return None
-    finally:
-        try:
-            if loop is not None and not loop.is_closed():
-                loop.close()
-        except Exception:
-            pass
 
 
 @dataclass
