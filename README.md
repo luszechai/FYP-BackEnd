@@ -49,9 +49,19 @@ The JSON file should have the following structure:
 
 ### 4. Run the Application
 
+**Interactive CLI (local terminal chat)**
+
 ```bash
 python main.py
 ```
+
+**HTTP API (for the React frontend or other clients)**
+
+```bash
+python api_server.py
+```
+
+The bundled `python api_server.py` entrypoint listens on **port 8001**. For uvicorn options and full route list see [`README_API.md`](./README_API.md).
 
 ## Features
 
@@ -66,23 +76,38 @@ python main.py
 
 ```
 FYP-BackEnd/
-├── main.py                 # Entry point
-├── config.py               # Configuration (reads from .env)
-├── .env                    # Environment variables (NOT in git)
-├── .env.example            # Template for .env
-├── requirements.txt        # Python dependencies
-├── merged_rag_data.json    # Your data file
+├── main.py                  # CLI chat entry point
+├── api_server.py            # FastAPI HTTP server (chat, RBS, Ragas, uploads, …)
+├── config.py                # Configuration (reads from .env)
+├── fetch_emails_to_rag.py   # Optional: IMAP → Chroma email chunks
+├── generate_testset.py      # Build / refresh eval_testset.json
+├── run_ragas_evaluation.py  # CLI Ragas helper (legacy file output)
+├── merged_rag_data.json     # Primary knowledge JSON (root `documents` list)
+├── eval_testset.json        # Ragas question set
+├── eval_runs/               # Saved per-dashboard evaluation runs (JSON)
+├── chroma_db/               # Persistent Chroma store (local, not always in git)
+├── requirements.txt
 └── src/
-    ├── chatbot.py          # Main chatbot class
-    ├── query_enhancer.py   # Query enhancement logic
-    ├── retrieval.py        # Hybrid retrieval strategies
-    ├── prompts.py          # Prompt templates
-    ├── adaptive_config.py  # Adaptive parameter adjustment
-    ├── utils.py            # Utility functions
-    ├── memory.py           # Conversation memory
-    ├── llm_provider.py     # LLM API interactions
-    ├── vector_db.py        # ChromaDB operations
-    └── evaluation.py       # Evaluation dashboard
+    ├── chatbot.py           # RAGChatbot orchestration
+    ├── retrieval.py         # HybridRetriever (dense + BM25 + fusion + boosts)
+    ├── bm25_search.py       # Sparse index over Chroma documents
+    ├── reranker.py          # Cross-encoder reranking
+    ├── vector_db.py         # ChromaDB + chunking / ingest from JSON
+    ├── web_crawler.py       # Sitemap crawl → JSON (separate from API ingest)
+    ├── query_enhancer.py    # Query-type detection + expansions
+    ├── query_rewriter.py    # LLM rewrite for retrieval
+    ├── adaptive_config.py   # Dynamic retrieval / token / memory knobs
+    ├── room_booking.py      # Room booking system client
+    ├── rbs_intent.py        # RBS intent detection
+    ├── document_loader.py   # PDF / image / office formats for uploads & tooling
+    ├── programme_catalog.py # Static programme reference injection
+    ├── scholarship_catalog.py
+    ├── evaluation.py        # Legacy session metrics dashboard helper
+    ├── ragas_evaluation.py  # Ragas scoring (used by API + scripts)
+    ├── prompts.py
+    ├── memory.py
+    ├── llm_provider.py
+    └── utils.py
 ```
 
 ## Configuration
@@ -91,14 +116,13 @@ Most settings can be adjusted in `config.py`. Key settings:
 
 - `USE_ADAPTIVE_CONFIG`: Enable/disable automatic parameter adjustment (default: True)
 - `RETRIEVAL_K`: Base number of documents to retrieve (default: 5)
-- `LLM_MAX_TOKENS`: Maximum response length (default: 1000)
-- `CHUNK_SIZE`: Document chunk size for vector DB (default: 1600)
+- `LLM_MAX_TOKENS`: Maximum response length (default: 1024)
+- `CHUNK_SIZE` / `CHUNK_OVERLAP`: Defaults in `config.py` (1600 / 200); the active splitter is configured in `src/vector_db.py` — update both if you change chunking policy.
 
 ## RAG Evaluation Dashboard
 
 The backend exposes a per-run evaluation API that powers the frontend
-Evaluation Dashboard (accessible via the flask-icon button in the header of
-the chat UI). It runs Ragas (Faithfulness, Answer Relevancy, Context
+Evaluation Dashboard (header control in the chat UI). It runs Ragas (Faithfulness, Answer Relevancy, Context
 Precision, Context Recall) against `eval_testset.json` using the currently
 loaded ChromaDB index. Each click in the dashboard produces two saved runs —
 an **all-off Baseline** and a user-selected **Optimized** run — so the panel
@@ -128,9 +152,9 @@ place for backward compatibility with `run_ragas_evaluation.py`.
     "use_reranker": true,
     "use_adaptive": true,
     "use_dedup": true,
+    "use_bm25": true,
     "use_person_boost": true,
-    "use_hybrid": true,
-    "use_compression": false
+    "use_hybrid": true
   }
 }
 ```
@@ -142,8 +166,7 @@ ChromaDB, LLM provider, and (if enabled) reranker.
 
 ### Run storage format
 
-Runs are persisted as JSON under [`eval_runs/`](./eval_runs/README.md) —
-see that README for the full schema. Key fields each run captures:
+Runs are persisted as JSON files under `eval_runs/` (one file per run). Key fields each run captures:
 
 - `strategies` — the exact toggle combination used.
 - `aggregate` — dataset-level Ragas averages (the 4 scorecard numbers).
@@ -153,24 +176,30 @@ see that README for the full schema. Key fields each run captures:
   reproducibility metadata so two runs taken at different times / different
   datasets can be compared unambiguously.
 
-A seeded example (`eval_runs/20260101T000000_baseline_all_off.json`) ships
-with the repo so the dashboard is non-empty on first open; it is safe to
-delete.
+If the folder already contains past runs, the dashboard can load them
+immediately; otherwise run one baseline + one optimized evaluation from the UI.
 
 ### Chunking / dataset A/B workflow
 
-Chunking decisions happen in `src/vector_db.py` and `merged_rag_data.json`,
-not in the dashboard. To compare two chunking or dataset variants:
+Chunking decisions happen in `src/vector_db.py` (e.g. `RecursiveCharacterTextSplitter`
+chunk size / overlap) and in the contents of `merged_rag_data.json`, not in the
+dashboard. Ingestion path: on startup, **`main.py` and `api_server.py` both load
+from `merged_rag_data.json` only when the Chroma collection is empty** (see
+`ChromaDBManager.add_documents_from_json`). To compare two chunking or dataset
+variants:
 
-1. Set `merged_rag_data.json` (or the chunking knobs in
-   `ChromaDBManager.create_collection`) to variant **A**.
-2. `python ingest_documents.py`.
-3. Open the dashboard → Execute A/B with a label like `legacy_chunking_v1`.
-4. Set the data / chunking to variant **B**.
-5. `python ingest_documents.py`.
-6. Open the dashboard → Execute A/B with a label like `recursive_chunking_v2`.
-7. Use the run-picker dropdowns on the two comparison panels to load both
-   labeled runs side-by-side.
+1. Point `merged_rag_data.json` (and/or edit chunking constants in
+   `src/vector_db.py`) to variant **A**.
+2. **Rebuild Chroma** so the collection is empty on next boot: stop any running
+   server, delete the `./chroma_db` directory (or remove only the target
+   collection), then start `python api_server.py` or `python main.py` so documents
+   are re-added from JSON.
+3. Open the dashboard → run `/api/ragas/run` (or the UI) with a label like
+   `legacy_chunking_v1`.
+4. Switch the data / chunking to variant **B**, repeat step 2 to rebuild Chroma.
+5. Run again with a label like `recursive_chunking_v2`.
+6. Use the run-picker on the comparison panels to load both labeled runs
+   side-by-side.
 
 If you swapped **content** (not just chunking), also run
 `python generate_testset.py` after step 5 so the two runs score against a
